@@ -152,7 +152,7 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 	return &pebbleIter{iter: iter}
 }
 
-// --- pebbleSnapshot ----------------------------------------------------------
+// pebbleSnapshot
 
 type pebbleSnapshot struct {
 	snap *pebble.Snapshot
@@ -200,7 +200,7 @@ func (s *pebbleSnapshot) NewIter(start, end []byte) engine.Iterator {
 func (s *pebbleSnapshot) Sequence() uint64 { return s.seq }
 func (s *pebbleSnapshot) Close() error     { return s.snap.Close() }
 
-// --- pebbleIter (raw; includes __dpx: keys) ----------------------------------
+// pebbleIter (raw; includes __dpx: keys)
 
 // pebbleIter wraps a pebble.Iterator and copies Key/Value eagerly.
 // Pebble's iterator invalidates Key() and Value() buffers on the next
@@ -217,7 +217,7 @@ func (i *pebbleIter) Value() []byte { return append([]byte(nil), i.iter.Value().
 func (i *pebbleIter) Error() error  { return i.iter.Error() }
 func (i *pebbleIter) Close() error  { return i.iter.Close() }
 
-// --- pebbleConsumerIter (skips __dpx: keys) ----------------------------------
+// pebbleConsumerIter (skips __dpx: keys)
 
 // pebbleConsumerIter wraps pebble.Iterator and skips reserved keys.
 // Key() and Value() copy eagerly for the same reason as pebbleIter.
@@ -265,7 +265,7 @@ func (i *pebbleConsumerIter) Value() []byte { return append([]byte(nil), i.iter.
 func (i *pebbleConsumerIter) Error() error  { return i.iter.Error() }
 func (i *pebbleConsumerIter) Close() error  { return i.iter.Close() }
 
-// --- pebbleBatch -------------------------------------------------------------
+// pebbleBatch
 
 type pebbleBatch struct{ b *pebble.Batch }
 
@@ -274,7 +274,7 @@ func (b *pebbleBatch) Delete(key []byte)       { b.b.Delete(key, nil) }
 func (b *pebbleBatch) Merge(key, value []byte) { b.b.Merge(key, value, nil) }
 func (b *pebbleBatch) Reset()                  { b.b.Reset() }
 
-// --- Int64Merger -------------------------------------------------------------
+// Int64Merger
 
 // Int64Merger is the Pebble Merger for AtomicAdd credit commutativity.
 // Name "dpx.int64add" is locked in the Pebble MANIFEST at Open time.
@@ -314,7 +314,7 @@ func (m *int64Merger) Finish(_ bool) ([]byte, io.Closer, error) {
 	return b, nil, nil
 }
 
-// --- helpers -----------------------------------------------------------------
+// helpers
 
 // isReserved reports whether key starts with the __dpx: prefix.
 func isReserved(key []byte) bool {
@@ -334,7 +334,7 @@ func decodeEpochRecord(b []byte) engine.EpochRecord {
 	}
 }
 
-// --- errIter -----------------------------------------------------------------
+// errIter
 
 // errIter is returned when iterator construction fails.
 // It immediately reports the error via Error() and is never Valid().

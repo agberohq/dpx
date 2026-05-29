@@ -27,7 +27,7 @@ import (
 	"github.com/agberohq/dpx/engine"
 )
 
-// ---- helpers ----------------------------------------------------------------
+// helpers
 
 func le64(v int64) []byte {
 	b := make([]byte, 8)
@@ -94,7 +94,7 @@ func applyMerge(tb testing.TB, e *Engine, key string, delta int64) {
 	}
 }
 
-// ---- Engine lifecycle -------------------------------------------------------
+// Engine lifecycle
 
 func TestEngine_OpenClose(t *testing.T) {
 	dir := t.TempDir()
@@ -137,7 +137,7 @@ func TestEngine_OpenCreatesDir(t *testing.T) {
 	}
 }
 
-// ---- Get / Set / Delete -----------------------------------------------------
+// Get / Set / Delete
 
 func TestEngine_GetMissingKey(t *testing.T) {
 	e := openEngine(t)
@@ -195,7 +195,7 @@ func TestEngine_OverwriteValue(t *testing.T) {
 	}
 }
 
-// ---- CurrentSequence --------------------------------------------------------
+// CurrentSequence
 
 func TestEngine_CurrentSequenceFreshIsZero(t *testing.T) {
 	e := openEngine(t)
@@ -240,7 +240,7 @@ func TestEngine_CurrentSequencePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// ---- Merge / Int64Merger ----------------------------------------------------
+// Merge / Int64Merger
 
 func TestEngine_MergeOnNewKey(t *testing.T) {
 	e := openEngine(t)
@@ -287,7 +287,7 @@ func TestEngine_MergeAfterSet(t *testing.T) {
 	}
 }
 
-// ---- Int64Merger internals --------------------------------------------------
+// Int64Merger internals
 
 func TestMerger_NilBase(t *testing.T) {
 	// Simulates a Merge call on a non-existent key (nil base value).
@@ -353,7 +353,7 @@ func TestMerger_ShortBaseValue(t *testing.T) {
 	}
 }
 
-// ---- Sync -------------------------------------------------------------------
+// Sync
 
 func TestEngine_SyncDoesNotError(t *testing.T) {
 	e := openEngine(t)
@@ -363,7 +363,7 @@ func TestEngine_SyncDoesNotError(t *testing.T) {
 	}
 }
 
-// ---- Snapshot ---------------------------------------------------------------
+// Snapshot
 
 func TestSnapshot_IsolatedFromSubsequentWrites(t *testing.T) {
 	e := openEngine(t)
@@ -463,7 +463,7 @@ func TestSnapshot_GetVersion_Present(t *testing.T) {
 	}
 }
 
-// ---- Consumer iterator (excludes __dpx:) ------------------------------------
+// Consumer iterator (excludes __dpx:)
 
 func TestSnapshot_NewIter_Forward(t *testing.T) {
 	e := openEngine(t)
@@ -611,7 +611,7 @@ func TestSnapshot_NewIter_Reverse(t *testing.T) {
 	}
 }
 
-// ---- RawIter ----------------------------------------------------------------
+// RawIter
 
 func TestRawIter_IncludesReservedKeys(t *testing.T) {
 	e := openEngine(t)
@@ -698,7 +698,7 @@ func TestRawIter_DoesNotIncludeUserKeys(t *testing.T) {
 	}
 }
 
-// ---- Checkpoint -------------------------------------------------------------
+// Checkpoint
 
 func TestCheckpoint_CreatesDir(t *testing.T) {
 	e := openEngine(t)
@@ -798,7 +798,7 @@ func TestCheckpoint_CompletesConcurrentlyWithWrites(t *testing.T) {
 	}
 }
 
-// ---- Batch Reset ------------------------------------------------------------
+// Batch Reset
 
 func TestBatch_Reset(t *testing.T) {
 	e := openEngine(t)
@@ -818,7 +818,7 @@ func TestBatch_Reset(t *testing.T) {
 	}
 }
 
-// ---- isReserved helper ------------------------------------------------------
+// isReserved helper
 
 func TestIsReserved(t *testing.T) {
 	cases := []struct {
@@ -841,7 +841,7 @@ func TestIsReserved(t *testing.T) {
 	}
 }
 
-// ---- decodeEpochRecord helper -----------------------------------------------
+// decodeEpochRecord helper
 
 func TestDecodeEpochRecord_NilInput(t *testing.T) {
 	er := decodeEpochRecord(nil)
@@ -872,7 +872,7 @@ func TestDecodeEpochRecord_RoundTrip(t *testing.T) {
 	}
 }
 
-// ---- Persistence across reopen ----------------------------------------------
+// Persistence across reopen
 
 func TestEngine_DataPersistsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
@@ -916,7 +916,7 @@ func TestEngine_MergePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// ---- Benchmarks -------------------------------------------------------------
+// Benchmarks
 // Run: go test -bench=. -benchtime=5s -count=3 ./engine/pebble/
 //
 // These benchmarks measure the storage engine in isolation — before any Raft

@@ -23,7 +23,7 @@ import (
 	"github.com/agberohq/dpx/engine"
 )
 
-// ---- helpers ----------------------------------------------------------------
+// helpers
 
 func le64(v int64) []byte {
 	b := make([]byte, 8)
@@ -74,7 +74,7 @@ func applyMerge(tb testing.TB, e *Engine, key string, delta int64) {
 	}
 }
 
-// ---- Engine lifecycle -------------------------------------------------------
+// Engine lifecycle
 
 func TestEngine_OpenClose(t *testing.T) {
 	e := New()
@@ -100,7 +100,7 @@ func TestEngine_SyncIsNoop(t *testing.T) {
 	}
 }
 
-// ---- Get / Set / Delete -----------------------------------------------------
+// Get / Set / Delete
 
 func TestEngine_GetMissingKey(t *testing.T) {
 	e := New()
@@ -169,7 +169,7 @@ func TestEngine_OverwriteValue(t *testing.T) {
 	}
 }
 
-// ---- Merge / mergeInt64 -----------------------------------------------------
+// Merge / mergeInt64
 
 func TestMerge_NilBase(t *testing.T) {
 	// nil existing → treats as 0
@@ -262,7 +262,7 @@ func TestEngine_SetThenMerge(t *testing.T) {
 	}
 }
 
-// ---- CurrentSequence / __dpx:applied ----------------------------------------
+// CurrentSequence / __dpx:applied
 
 func TestEngine_CurrentSequenceFreshIsZero(t *testing.T) {
 	e := New()
@@ -307,7 +307,7 @@ func TestEngine_VersionKeyRoutedToVersions(t *testing.T) {
 	}
 }
 
-// ---- Batch Reset ------------------------------------------------------------
+// Batch Reset
 
 func TestBatch_Reset(t *testing.T) {
 	e := New()
@@ -335,7 +335,7 @@ func TestBatch_SetCopiesValue(t *testing.T) {
 	}
 }
 
-// ---- Sorted key index -------------------------------------------------------
+// Sorted key index
 
 func TestSortedIndex_InsertMaintainsOrder(t *testing.T) {
 	e := New()
@@ -395,7 +395,7 @@ func TestSortedIndex_DeleteRemovesKey(t *testing.T) {
 	}
 }
 
-// ---- GetSnapshot ------------------------------------------------------------
+// GetSnapshot
 
 func TestSnapshot_IsolatedFromSubsequentWrites(t *testing.T) {
 	e := New()
@@ -498,7 +498,7 @@ func TestSnapshot_GetVersion_Present(t *testing.T) {
 	}
 }
 
-// ---- NewIter (consumer, excludes __dpx:) ------------------------------------
+// NewIter (consumer, excludes __dpx:)
 
 func TestSnapshot_NewIter_Forward(t *testing.T) {
 	e := New()
@@ -633,10 +633,10 @@ func TestIter_ValidAfterClose(t *testing.T) {
 	snap.Close()
 
 	// After Close, Valid returns false.
-	// (memIter does not nil out pairs on Close, but idx is valid for the test.)
+
 }
 
-// ---- RawIter ----------------------------------------------------------------
+// RawIter
 
 func TestRawIter_IncludesReservedKeys(t *testing.T) {
 	e := New()
@@ -699,7 +699,7 @@ func TestRawIter_BinaryKeyBeyond0x7E(t *testing.T) {
 	}
 }
 
-// ---- Checkpoint -------------------------------------------------------------
+// Checkpoint
 
 func TestCheckpoint_WritesFile(t *testing.T) {
 	e := New()
@@ -719,7 +719,7 @@ func TestCheckpoint_WritesFile(t *testing.T) {
 	}
 }
 
-// ---- isReserved (package-internal) ------------------------------------------
+// isReserved (package-internal)
 
 func TestIsReserved(t *testing.T) {
 	cases := []struct {
@@ -742,7 +742,7 @@ func TestIsReserved(t *testing.T) {
 	}
 }
 
-// ---- Concurrency smoke test -------------------------------------------------
+// Concurrency smoke test
 
 func TestEngine_ConcurrentApplyBatch(t *testing.T) {
 	e := New()
@@ -812,7 +812,7 @@ func TestEngine_ConcurrentSnapshotAndWrite(t *testing.T) {
 	}
 }
 
-// ---- decodeEpochRecord (package-internal) ------------------------------------
+// decodeEpochRecord (package-internal)
 
 func TestDecodeEpochRecord_NilInput(t *testing.T) {
 	er := decodeEpochRecord(nil)
@@ -837,7 +837,7 @@ func TestDecodeEpochRecord_RoundTrip(t *testing.T) {
 	}
 }
 
-// ---- Benchmarks -------------------------------------------------------------
+// Benchmarks
 // Run: go test -bench=. -benchtime=5s -count=3 ./engine/memory/
 
 func BenchmarkEngine_SetGet(b *testing.B) {

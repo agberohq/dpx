@@ -10,7 +10,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// ---- shared helpers ---------------------------------------------------------
+// shared helpers
 
 func le64(v int64) []byte {
 	b := make([]byte, 8)
@@ -77,7 +77,7 @@ func applyMerge(tb testing.TB, e *Engine, key string, delta int64) {
 	}
 }
 
-// ---- Engine lifecycle -------------------------------------------------------
+// Engine lifecycle
 
 func TestEngine_OpenClose(t *testing.T) {
 	dir := t.TempDir()
@@ -118,7 +118,7 @@ func TestEngine_OpenCreatesDir(t *testing.T) {
 	}
 }
 
-// ---- Get / Set / Delete -----------------------------------------------------
+// Get / Set / Delete
 
 func TestEngine_GetMissingKey(t *testing.T) {
 	e := openEngine(t)
@@ -171,7 +171,7 @@ func TestEngine_OverwriteValue(t *testing.T) {
 	}
 }
 
-// ---- Merge ------------------------------------------------------------------
+// Merge
 
 func TestEngine_MergeOnNewKey(t *testing.T) {
 	e := openEngine(t)
@@ -224,7 +224,7 @@ func TestEngine_MergeNegativeResult(t *testing.T) {
 	}
 }
 
-// ---- CurrentSequence --------------------------------------------------------
+// CurrentSequence
 
 func TestEngine_CurrentSequenceFreshIsZero(t *testing.T) {
 	e := openEngine(t)
@@ -266,7 +266,7 @@ func TestEngine_CurrentSequencePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// ---- Sync -------------------------------------------------------------------
+// Sync
 
 func TestEngine_SyncDoesNotError(t *testing.T) {
 	e := openEngine(t)
@@ -276,7 +276,7 @@ func TestEngine_SyncDoesNotError(t *testing.T) {
 	}
 }
 
-// ---- Snapshot ---------------------------------------------------------------
+// Snapshot
 
 func TestSnapshot_IsolatedFromSubsequentWrites(t *testing.T) {
 	e := openEngine(t)
@@ -352,7 +352,7 @@ func TestSnapshot_GetVersion_Present(t *testing.T) {
 	}
 }
 
-// ---- Consumer iterator ------------------------------------------------------
+// Consumer iterator
 
 func TestSnapshot_NewIter_Forward(t *testing.T) {
 	e := openEngine(t)
@@ -457,7 +457,7 @@ func TestSnapshot_NewIter_EmptyRange(t *testing.T) {
 	}
 }
 
-// ---- RawIter ----------------------------------------------------------------
+// RawIter
 
 func TestRawIter_IncludesReservedKeys(t *testing.T) {
 	e := openEngine(t)
@@ -519,7 +519,7 @@ func TestRawIter_BinaryKeyBeyond0x7E(t *testing.T) {
 	}
 }
 
-// ---- Checkpoint -------------------------------------------------------------
+// Checkpoint
 
 func TestCheckpoint_WritesFile(t *testing.T) {
 	e := openEngine(t)
@@ -569,7 +569,7 @@ func TestCheckpoint_ContainsAllKeys(t *testing.T) {
 	}
 }
 
-// ---- Batch Reset ------------------------------------------------------------
+// Batch Reset
 
 func TestBatch_Reset(t *testing.T) {
 	b := (&Engine{}).NewBatch().(*badgerBatch)
@@ -594,7 +594,7 @@ func TestBatch_SetCopiesValue(t *testing.T) {
 	}
 }
 
-// ---- Persistence across reopen ----------------------------------------------
+// Persistence across reopen
 
 func TestEngine_DataPersistsAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
@@ -634,7 +634,7 @@ func TestEngine_MergePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// ---- isReserved / decodeEpochRecord -----------------------------------------
+// isReserved / decodeEpochRecord
 
 func TestIsReserved(t *testing.T) {
 	cases := []struct {
@@ -672,7 +672,7 @@ func TestDecodeEpochRecord_RoundTrip(t *testing.T) {
 	}
 }
 
-// ---- Benchmarks -------------------------------------------------------------
+// Benchmarks
 //
 // Badger uses read-modify-write for Merge (no native merge operator).
 // Run: go test -benchmem -bench=. -run='^$' -count=2 -cpu=8 ./engine/badger/

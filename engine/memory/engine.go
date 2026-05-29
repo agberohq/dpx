@@ -215,7 +215,7 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 	return &memIter{pairs: pairs, idx: -1}
 }
 
-// --- sorted key index ---
+// sorted key index
 
 func (e *Engine) insertKey(k string) {
 	i := sort.SearchStrings(e.keys, k)
@@ -235,7 +235,7 @@ func (e *Engine) deleteKey(k string) {
 	e.keys = append(e.keys[:i], e.keys[i+1:]...)
 }
 
-// --- memSnapshot ---
+// memSnapshot
 
 type memSnapshot struct {
 	data     map[string][]byte
@@ -301,7 +301,7 @@ func isReserved(key string) bool {
 	return len(key) >= 6 && key[:6] == "__dpx:"
 }
 
-// --- memIter ---
+// memIter
 
 type memIter struct {
 	pairs [][2][]byte

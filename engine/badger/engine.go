@@ -237,7 +237,7 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 	return &badgerIter{pairs: pairs, idx: -1}
 }
 
-// --- badgerSnapshot ----------------------------------------------------------
+// badgerSnapshot
 
 type badgerSnapshot struct {
 	txn *badger.Txn
@@ -299,7 +299,7 @@ func (s *badgerSnapshot) NewIter(start, end []byte) engine.Iterator {
 func (s *badgerSnapshot) Sequence() uint64 { return s.seq }
 func (s *badgerSnapshot) Close() error     { s.txn.Discard(); return nil }
 
-// --- badgerBatch -------------------------------------------------------------
+// badgerBatch
 
 type opType byte
 
@@ -335,7 +335,7 @@ func (b *badgerBatch) Merge(key, value []byte) {
 
 func (b *badgerBatch) Reset() { b.ops = b.ops[:0] }
 
-// --- badgerIter --------------------------------------------------------------
+// badgerIter
 
 // badgerIter is a materialised iterator backed by a pre-collected slice.
 // We materialise eagerly because Badger's transaction-bound iterator cannot
@@ -366,7 +366,7 @@ func (i *badgerIter) Value() []byte {
 	return i.pairs[i.idx][1]
 }
 
-// --- helpers -----------------------------------------------------------------
+// helpers
 
 func isReserved(key []byte) bool {
 	const prefix = "__dpx:"
