@@ -1,20 +1,13 @@
 package dpx
 
-// Tests for dpxTx — the KVTx implementation for one RunInTx attempt.
-// dpxTx is unexported so these tests live in package dpx (white-box).
-//
-// dpxTx is built against an engine.Snapshot. We use a fakeSnapshot that
-// returns controlled data so tests are deterministic and have no I/O.
-
 import (
 	"context"
 	"encoding/binary"
 	"testing"
 
 	"github.com/agberohq/dpx/engine"
+	"github.com/agberohq/dpx/shared"
 )
-
-// fakeSnapshot
 
 type fakeSnapshot struct {
 	data     map[string][]byte
@@ -52,14 +45,12 @@ func (s *fakeSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 func (s *fakeSnapshot) NewIter(start, end []byte) engine.Iterator {
 	st, en := string(start), string(end)
 	var pairs [][2][]byte
-	// collect keys in order (simple linear scan for test scale)
 	var keys []string
 	for k := range s.data {
 		if k >= st && (en == "" || k < en) {
 			keys = append(keys, k)
 		}
 	}
-	// sort naively
 	for i := 0; i < len(keys); i++ {
 		for j := i + 1; j < len(keys); j++ {
 			if keys[j] < keys[i] {
@@ -103,13 +94,11 @@ func (i *fakeIter) Value() []byte {
 	return i.pairs[i.idx][1]
 }
 
-// helpers
-
 func newTx(snap *fakeSnapshot) *dpxTx {
 	return &dpxTx{
 		snap:    snap,
-		readSet: make(map[string]ReadEntry),
-		writes:  make([]WriteEntry, 0, 4),
+		readSet: make(map[string]shared.ReadEntry),
+		writes:  make([]shared.WriteEntry, 0, 4),
 	}
 }
 
@@ -125,8 +114,6 @@ func decode64tx(b []byte) int64 {
 	}
 	return int64(binary.LittleEndian.Uint64(b))
 }
-
-// Get
 
 func TestTx_Get_PopulatesReadSet(t *testing.T) {
 	snap := newFakeSnapshot(10)
@@ -180,8 +167,6 @@ func TestTx_Get_ReservedKeyRejected(t *testing.T) {
 	}
 }
 
-// Set
-
 func TestTx_Set_AppendsWrite(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
 	ctx := context.Background()
@@ -192,7 +177,7 @@ func TestTx_Set_AppendsWrite(t *testing.T) {
 	if len(tx.writes) != 1 {
 		t.Fatalf("expected 1 write, got %d", len(tx.writes))
 	}
-	if tx.writes[0].Op != OpSet {
+	if tx.writes[0].Op != shared.OpSet {
 		t.Errorf("op = %v, want OpSet", tx.writes[0].Op)
 	}
 	if string(tx.writes[0].Value) != "v" {
@@ -206,7 +191,7 @@ func TestTx_Set_CopiesValue(t *testing.T) {
 
 	val := []byte("original")
 	_ = tx.Set(ctx, []byte("k"), val)
-	val[0] = 'X' // mutate original
+	val[0] = 'X'
 
 	if string(tx.writes[0].Value) != "original" {
 		t.Error("Set did not copy value")
@@ -229,14 +214,12 @@ func TestTx_Set_ReservedKeyRejected(t *testing.T) {
 	}
 }
 
-// Delete
-
 func TestTx_Delete_AppendsWrite(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
 	if err := tx.Delete(context.Background(), []byte("k")); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if len(tx.writes) != 1 || tx.writes[0].Op != OpDelete {
+	if len(tx.writes) != 1 || tx.writes[0].Op != shared.OpDelete {
 		t.Errorf("expected OpDelete write, got %+v", tx.writes)
 	}
 }
@@ -249,8 +232,6 @@ func TestTx_Delete_DoesNotPopulateReadSet(t *testing.T) {
 	}
 }
 
-// AtomicAdd
-
 func TestTx_AtomicAdd_Credit_NoReadSet(t *testing.T) {
 	snap := newFakeSnapshot(1)
 	snap.set("bal", le64tx(50), 1, false)
@@ -261,16 +242,13 @@ func TestTx_AtomicAdd_Credit_NoReadSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicAdd credit: %v", err)
 	}
-	// Returns snapshot-time value (50), not post-credit value.
 	if ret != 50 {
 		t.Errorf("credit return = %d, want 50 (snapshot-time)", ret)
 	}
-	// Key must NOT be in readSet.
 	if _, ok := tx.readSet["bal"]; ok {
 		t.Error("credit should not add key to readSet")
 	}
-	// Write must be OpCredit.
-	if len(tx.writes) != 1 || tx.writes[0].Op != OpCredit {
+	if len(tx.writes) != 1 || tx.writes[0].Op != shared.OpCredit {
 		t.Errorf("expected OpCredit, got %+v", tx.writes)
 	}
 }
@@ -285,7 +263,6 @@ func TestTx_AtomicAdd_Debit_InReadSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicAdd debit: %v", err)
 	}
-	// Speculative post-debit value.
 	if ret != 70 {
 		t.Errorf("debit return = %d, want 70", ret)
 	}
@@ -299,7 +276,7 @@ func TestTx_AtomicAdd_Debit_InReadSet(t *testing.T) {
 	if re.Epoch != 3 {
 		t.Errorf("epoch = %d, want 3", re.Epoch)
 	}
-	if len(tx.writes) != 1 || tx.writes[0].Op != OpDebit {
+	if len(tx.writes) != 1 || tx.writes[0].Op != shared.OpDebit {
 		t.Errorf("expected OpDebit write, got %+v", tx.writes)
 	}
 }
@@ -320,7 +297,6 @@ func TestTx_AtomicAdd_Probe_InReadSet_NoWrite(t *testing.T) {
 	if _, ok := tx.readSet["bal"]; !ok {
 		t.Error("probe must add key to readSet")
 	}
-	// Probe produces no write entry (delta == 0).
 	if len(tx.writes) != 0 {
 		t.Errorf("probe should not buffer a write, got %+v", tx.writes)
 	}
@@ -334,7 +310,6 @@ func TestTx_AtomicAdd_CreditOnMissingKey_ReturnsZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicAdd credit missing: %v", err)
 	}
-	// decodeInt64(nil) == 0, so snapshot-time return is 0.
 	if ret != 0 {
 		t.Errorf("credit on missing key return = %d, want 0", ret)
 	}
@@ -348,7 +323,6 @@ func TestTx_AtomicAdd_DebitOnMissingKey_ReturnsNegativeDelta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AtomicAdd debit missing: %v", err)
 	}
-	// 0 + (-10) = -10 (the engine layer enforces sufficiency, not dpxTx)
 	if ret != -10 {
 		t.Errorf("debit on missing key return = %d, want -10", ret)
 	}
@@ -361,8 +335,6 @@ func TestTx_AtomicAdd_ReservedKeyRejected(t *testing.T) {
 		t.Errorf("got %v, want ErrReservedKey", err)
 	}
 }
-
-// GetRange
 
 func TestTx_GetRange_AdvisoryNotInReadSet(t *testing.T) {
 	snap := newFakeSnapshot(1)
@@ -378,7 +350,6 @@ func TestTx_GetRange_AdvisoryNotInReadSet(t *testing.T) {
 	if len(pairs) != 2 {
 		t.Errorf("got %d pairs, want 2", len(pairs))
 	}
-	// ReadSet must be empty — GetRange is advisory.
 	if len(tx.readSet) != 0 {
 		t.Errorf("GetRange must not populate readSet, got %v", tx.readSet)
 	}
@@ -397,8 +368,6 @@ func TestTx_GetRange_LimitApplied(t *testing.T) {
 	}
 }
 
-// empty / validate
-
 func TestTx_Empty_NoWrites(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
 	if !tx.empty() {
@@ -407,7 +376,6 @@ func TestTx_Empty_NoWrites(t *testing.T) {
 }
 
 func TestTx_Empty_AfterProbeOnlyIsFalse(t *testing.T) {
-	// Probe (delta=0) adds to readSet but no write entry → still empty.
 	snap := newFakeSnapshot(1)
 	snap.set("k", le64tx(5), 1, false)
 	tx := newTx(snap)
@@ -428,7 +396,7 @@ func TestTx_Empty_AfterSetIsFalse(t *testing.T) {
 func TestTx_Validate_CreditAndDelete_SameKey(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
 	ctx := context.Background()
-	_, _ = tx.AtomicAdd(ctx, []byte("k"), 10) // credit
+	_, _ = tx.AtomicAdd(ctx, []byte("k"), 10)
 	_ = tx.Delete(ctx, []byte("k"))
 
 	if err := tx.validate(); err != ErrInvalidProposal {
@@ -439,8 +407,8 @@ func TestTx_Validate_CreditAndDelete_SameKey(t *testing.T) {
 func TestTx_Validate_CreditAndDelete_DifferentKeys(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
 	ctx := context.Background()
-	_, _ = tx.AtomicAdd(ctx, []byte("a"), 10) // credit on "a"
-	_ = tx.Delete(ctx, []byte("b"))           // delete "b" — no conflict
+	_, _ = tx.AtomicAdd(ctx, []byte("a"), 10)
+	_ = tx.Delete(ctx, []byte("b"))
 
 	if err := tx.validate(); err != nil {
 		t.Errorf("different keys: got %v, want nil", err)
@@ -453,8 +421,6 @@ func TestTx_Validate_EmptyIsNil(t *testing.T) {
 		t.Errorf("empty tx validate: %v", err)
 	}
 }
-
-// readSetSlice
 
 func TestTx_ReadSetSlice_Empty(t *testing.T) {
 	tx := newTx(newFakeSnapshot(1))
@@ -471,15 +437,13 @@ func TestTx_ReadSetSlice_ContainsAllEntries(t *testing.T) {
 	ctx := context.Background()
 
 	_, _ = tx.Get(ctx, []byte("a"))
-	_, _ = tx.AtomicAdd(ctx, []byte("b"), -5) // debit
+	_, _ = tx.AtomicAdd(ctx, []byte("b"), -5)
 
 	rs := tx.readSetSlice()
 	if len(rs) != 2 {
 		t.Fatalf("readSetSlice len = %d, want 2", len(rs))
 	}
 }
-
-// AllocateNextSequence
 
 func TestTx_AllocateNextSequence_IsSnapPlusOne(t *testing.T) {
 	snap := newFakeSnapshot(42)

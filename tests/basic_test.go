@@ -6,11 +6,12 @@ import (
 
 	"github.com/agberohq/dpx"
 	"github.com/agberohq/dpx/engine/memory"
+	dpxraft "github.com/agberohq/dpx/raft"
 )
 
 func openMemNode(t testing.TB) *dpx.Node {
 	t.Helper()
-	n, err := dpx.Open(dpx.Config{Engine: memory.New()})
+	n, err := dpx.Open(dpx.Config{Engine: memory.New(), RaftDir: t.TempDir()}, dpxraft.Open)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

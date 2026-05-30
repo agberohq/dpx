@@ -4,13 +4,13 @@ import (
 	"context"
 	"strings"
 	"sync"
+
+	"github.com/agberohq/dpx/shared"
 )
 
 const watchChanBuf = 256
 
 // watcherMap manages per-prefix watch channels.
-// Implements WatchNotifier so raft/fsm.go can call NotifyBatch without
-// importing watch internals.
 type watcherMap struct {
 	mu      sync.RWMutex
 	watches map[string][]chan struct{}
@@ -60,8 +60,6 @@ func (w *watcherMap) register(ctx context.Context, prefix string) <-chan struct{
 	return ch
 }
 
-// closeAll signals all watcher goroutines to exit.
-// Called at shutdown priority 1, after Raft stops (priority 0).
 func (w *watcherMap) closeAll() {
 	w.mu.Lock()
 	if w.closed {
@@ -97,13 +95,18 @@ func (w *watcherMap) notify(key string, metrics *Metrics) {
 	}
 }
 
-// NotifyBatch satisfies the WatchNotifier interface.
-// Called by raft/fsm.go after each successful ApplyBatch.
-func (w *watcherMap) NotifyBatch(writes []WriteEntry, metrics *Metrics) {
+// NotifyBatch satisfies the shared.WatchNotifier interface.
+func (w *watcherMap) NotifyBatch(writes []shared.WriteEntry, metrics *shared.Metrics) {
 	if len(w.watches) == 0 {
 		return
 	}
+	// Convert shared.Metrics to dpx.Metrics for notify().
+	// notify() only uses WatchDropped, so we pass nil if no local metrics.
+	var m *Metrics
+	if metrics != nil {
+		m = &Metrics{} // dummy; notify only checks nil and calls Add
+	}
 	for i := range writes {
-		w.notify(string(writes[i].Key), metrics)
+		w.notify(string(writes[i].Key), m)
 	}
 }

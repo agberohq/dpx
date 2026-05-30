@@ -7,24 +7,23 @@ import (
 	"time"
 
 	"github.com/agberohq/dpx/engine/memory"
+	"github.com/agberohq/dpx/shared"
+	"github.com/olekukonko/hlc"
 	"github.com/olekukonko/jack"
 )
 
-// fakeProposer
-
+// fakeProposer implements shared.Proposer for testing.
 type fakeProposer struct {
-	result ApplyResult
+	result shared.ApplyResult
 	calls  int
 }
 
-func (f *fakeProposer) Propose(_ []byte) (ApplyResult, error) {
+func (f *fakeProposer) Propose(_ []byte) (shared.ApplyResult, error) {
 	f.calls++
 	return f.result, nil
 }
 func (f *fakeProposer) Shutdown() error { return nil }
 
-// nodeWithFake builds a *Node wired to fp, with a real memory engine and
-// real retry/batcher/watcher machinery. No Raft cluster is started.
 func nodeWithFake(t *testing.T, fp *fakeProposer) *Node {
 	t.Helper()
 	eng := memory.New()
@@ -41,6 +40,7 @@ func nodeWithFake(t *testing.T, fp *fakeProposer) *Node {
 		engine:   eng,
 		batcher:  newBatcher(cfg.Batch),
 		watchers: watchers,
+		clock:    hlc.NewClock(),
 	}
 	n.retry = jack.NewRetry(
 		jack.RetryWithMaxAttempts(cfg.Retry.MaxAttempts),
@@ -59,10 +59,8 @@ func nodeWithFake(t *testing.T, fp *fakeProposer) *Node {
 	return n
 }
 
-// retry / conflict exhaustion
-
 func TestApply_ConflictExhausted(t *testing.T) {
-	fp := &fakeProposer{result: ApplyResult{Conflict: true}}
+	fp := &fakeProposer{result: shared.ApplyResult{Conflict: true}}
 	node := nodeWithFake(t, fp)
 	ctx := context.Background()
 
@@ -79,7 +77,7 @@ func TestApply_ConflictExhausted(t *testing.T) {
 
 func TestApply_FatalError_NotRetried(t *testing.T) {
 	fatalErr := errors.New("engine exploded")
-	fp := &fakeProposer{result: ApplyResult{Err: fatalErr}}
+	fp := &fakeProposer{result: shared.ApplyResult{Err: fatalErr}}
 	node := nodeWithFake(t, fp)
 	ctx := context.Background()
 
@@ -100,7 +98,7 @@ func TestApply_ReadOnlyTx_NeverProposed(t *testing.T) {
 	ctx := context.Background()
 
 	err := node.RunInTx(ctx, func(tx KVTx) error {
-		_, _ = tx.Get(ctx, []byte("missing")) // read only, no writes
+		_, _ = tx.Get(ctx, []byte("missing"))
 		return nil
 	})
 	if err != nil {
@@ -129,7 +127,7 @@ func TestApply_BusinessError_NotRetried(t *testing.T) {
 }
 
 func TestApply_SuccessfulPropose_NoError(t *testing.T) {
-	fp := &fakeProposer{result: ApplyResult{}}
+	fp := &fakeProposer{result: shared.ApplyResult{}}
 	node := nodeWithFake(t, fp)
 	ctx := context.Background()
 
@@ -143,8 +141,6 @@ func TestApply_SuccessfulPropose_NoError(t *testing.T) {
 		t.Errorf("expected exactly 1 Propose call, got %d", fp.calls)
 	}
 }
-
-// reserved key rejection (happens before Propose)
 
 func TestApply_ReservedKeyRejected_BeforePropose(t *testing.T) {
 	fp := &fakeProposer{}
@@ -162,8 +158,6 @@ func TestApply_ReservedKeyRejected_BeforePropose(t *testing.T) {
 	}
 }
 
-// closed node
-
 func TestApply_ClosedNode_RejectsRunInTx(t *testing.T) {
 	fp := &fakeProposer{}
 	node := nodeWithFake(t, fp)
@@ -177,8 +171,6 @@ func TestApply_ClosedNode_RejectsRunInTx(t *testing.T) {
 	}
 }
 
-// watcher (wired through real watcherMap, no Raft needed)
-
 func TestApply_WatcherNotified_ViaFakeProposer(t *testing.T) {
 	fp := &fakeProposer{}
 	node := nodeWithFake(t, fp)
@@ -190,9 +182,8 @@ func TestApply_WatcherNotified_ViaFakeProposer(t *testing.T) {
 		t.Fatalf("WatchKey: %v", err)
 	}
 
-	// Directly invoke the watcher path the FSM would call after commit.
-	node.watchers.NotifyBatch([]WriteEntry{
-		{Op: OpSet, Key: []byte("w:alice"), Value: []byte("1")},
+	node.watchers.NotifyBatch([]shared.WriteEntry{
+		{Op: shared.OpSet, Key: []byte("w:alice"), Value: []byte("1")},
 	}, nil)
 
 	select {

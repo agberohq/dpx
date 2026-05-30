@@ -9,6 +9,7 @@ package memory
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,15 +32,55 @@ type Engine struct {
 
 // New creates an in-memory engine.
 func New() *Engine {
+	// Use a unique subdirectory so that Restore()'s os.RemoveAll(DataDir())
+	// doesn't try to delete the system temp directory.
+	dir, _ := os.MkdirTemp("", "dpx-memory-*")
 	return &Engine{
 		data:     make(map[string][]byte),
 		versions: make(map[string]engine.EpochRecord),
 		keys:     make([]string, 0, 1024),
-		dir:      os.TempDir(),
+		dir:      dir,
 	}
 }
 
-func (e *Engine) Open() error     { return nil }
+func (e *Engine) Open() error {
+	// Load state from a previous CreateCheckpoint if one exists in DataDir.
+	path := filepath.Join(e.dir, "dump")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // fresh engine
+		}
+		return err
+	}
+	type dump struct {
+		Data     map[string][]byte
+		Versions map[string]engine.EpochRecord
+		Applied  uint64
+	}
+	var d dump
+	if err := msgpack.Unmarshal(b, &d); err != nil {
+		return fmt.Errorf("memory engine: load dump: %w", err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.data = d.Data
+	if e.data == nil {
+		e.data = make(map[string][]byte)
+	}
+	e.versions = d.Versions
+	if e.versions == nil {
+		e.versions = make(map[string]engine.EpochRecord)
+	}
+	e.applied = d.Applied
+	// Rebuild sorted keys index.
+	e.keys = make([]string, 0, len(e.data))
+	for k := range e.data {
+		e.keys = append(e.keys, k)
+	}
+	sort.Strings(e.keys)
+	return nil
+}
 func (e *Engine) DataDir() string { return e.dir }
 func (e *Engine) Close() error    { return nil }
 func (e *Engine) Sync() error     { return nil }

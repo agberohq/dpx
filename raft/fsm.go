@@ -1,13 +1,4 @@
 // Package raft wires HashiCorp Raft into DPX.
-// It contains only two things: the FSM (this file) and the cluster setup (node.go).
-// Everything else — transactions, batching, watchers, encoding — stays in the
-// parent dpx package.
-//
-// Import graph:
-//
-//	dpx        — public API, no Raft library import
-//	dpx/raft   — imports dpx (for shared types) and hashicorp/raft
-//	caller     — imports dpx and dpx/raft, passes dpxraft.Open to dpx.Open
 package raft
 
 import (
@@ -22,15 +13,12 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/agberohq/dpx"
 	"github.com/agberohq/dpx/engine"
+	"github.com/agberohq/dpx/shared"
 	hraft "github.com/hashicorp/raft"
+	"github.com/olekukonko/hlc"
 	"github.com/vmihailenco/msgpack/v5"
 )
-
-// FSM-private encoding helpers
-// These are implementation details of the FSM. They are not exported and do
-// not belong in the parent dpx package.
 
 var (
 	rawIterStart = []byte("__dpx:ver:")
@@ -69,43 +57,43 @@ func encodeUint64(v uint64, buf []byte) []byte {
 	return b
 }
 
-// applyState
-
 type applyState struct {
 	keyEpoch map[string]engine.EpochRecord
 	applied  uint64
 }
 
-// dpxFSM
-
-// dpxFSM implements hraft.BatchingFSM.
-//
-// HashiCorp Raft guarantees Apply/ApplyBatch are never called concurrently
-// with each other, so keyEpoch and the shadow pool need no locking.
-// Snapshot() may run concurrently with Persist() but NOT with Apply.
 type dpxFSM struct {
 	engine     engine.StorageEngine
 	state      applyState
-	syncPolicy dpx.SyncPolicy
+	syncPolicy shared.SyncPolicy
+	clock      *hlc.Clock
 
-	pool      sync.Pool // reuses shadow maps; cleared per ApplyBatch call
-	vkBufPool sync.Pool // reuses version-key construction buffers
+	pool      sync.Pool
+	vkBufPool sync.Pool
 
-	watchers dpx.WatchNotifier // shared with Node; called after each commit
-	metrics  *dpx.Metrics
+	watchers shared.WatchNotifier
+	metrics  *shared.Metrics
 }
 
 func newFSM(
 	eng engine.StorageEngine,
-	syncPolicy dpx.SyncPolicy,
-	watchers dpx.WatchNotifier,
-	metrics *dpx.Metrics,
+	syncPolicy shared.SyncPolicy,
+	watchers shared.WatchNotifier,
+	metrics *shared.Metrics,
+	clock *hlc.Clock,
 ) *dpxFSM {
 	return &dpxFSM{
 		engine:     eng,
 		syncPolicy: syncPolicy,
 		watchers:   watchers,
 		metrics:    metrics,
+		clock:      clock,
+		state: applyState{
+			// Initialise to empty map. node.Open() calls f.open() immediately
+			// after construction to rebuild from existing engine data on restart.
+			// For a fresh engine this stays empty, which is correct.
+			keyEpoch: make(map[string]engine.EpochRecord, 1<<10),
+		},
 		pool: sync.Pool{
 			New: func() any { return make(map[string]engine.EpochRecord, 256) },
 		},
@@ -115,8 +103,6 @@ func newFSM(
 	}
 }
 
-// open scans __dpx:ver:* to rebuild keyEpoch and reads __dpx:applied.
-// Called once after the Raft node starts, and again inside Restore.
 func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
 	start := time.Now()
 	f.state.keyEpoch = make(map[string]engine.EpochRecord, 1<<16)
@@ -158,17 +144,13 @@ func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
 	return f.state.applied, nil
 }
 
-// Apply implements hraft.FSM — single committed LogCommand entry.
 func (f *dpxFSM) Apply(log *hraft.Log) interface{} {
 	if log.Type != hraft.LogCommand {
-		return dpx.ApplyResult{}
+		return shared.ApplyResult{}
 	}
 	return f.applyBatch([]*hraft.Log{log})[0]
 }
 
-// ApplyBatch implements hraft.BatchingFSM — multiple entries committed together.
-// This recovers the batching behaviour of Dragonboat's Update([]Entry).
-// The returned slice must be the same length as the input.
 func (f *dpxFSM) ApplyBatch(logs []*hraft.Log) []interface{} {
 	return f.applyBatch(logs)
 }
@@ -184,29 +166,33 @@ func (f *dpxFSM) applyBatch(logs []*hraft.Log) []interface{} {
 
 	for i, log := range logs {
 		if log.Type != hraft.LogCommand {
-			results[i] = dpx.ApplyResult{}
+			results[i] = shared.ApplyResult{}
 			continue
 		}
 
-		var proposal dpx.Proposal
+		var proposal shared.Proposal
 		if err := msgpack.Unmarshal(log.Data, &proposal); err != nil {
-			results[i] = dpx.ApplyResult{
+			results[i] = shared.ApplyResult{
 				Err: fmt.Errorf("dpx/raft: corrupt entry at index %d: %w", log.Index, err),
 			}
 			continue
 		}
 
+		if !proposal.TimestampIsZero() {
+			f.clock.Observe(hlc.Timestamp{Wall: proposal.TimestampWall, Counter: proposal.TimestampCounter})
+		}
+
 		if f.detectConflict(&proposal, shadow) {
-			results[i] = dpx.ApplyResult{Conflict: true}
+			results[i] = shared.ApplyResult{Conflict: true}
 			continue
 		}
 
 		if err := f.applyProposal(log.Index, &proposal, shadow); err != nil {
-			results[i] = dpx.ApplyResult{Err: err}
+			results[i] = shared.ApplyResult{Err: err}
 			continue
 		}
 
-		results[i] = dpx.ApplyResult{}
+		results[i] = shared.ApplyResult{}
 
 		if f.watchers != nil {
 			f.watchers.NotifyBatch(proposal.Writes, f.metrics)
@@ -215,9 +201,8 @@ func (f *dpxFSM) applyBatch(logs []*hraft.Log) []interface{} {
 	return results
 }
 
-func (f *dpxFSM) detectConflict(proposal *dpx.Proposal, shadow map[string]engine.EpochRecord) bool {
+func (f *dpxFSM) detectConflict(proposal *shared.Proposal, shadow map[string]engine.EpochRecord) bool {
 	for _, re := range proposal.ReadSet {
-
 		shadowKey := unsafe.String(unsafe.SliceData(re.Key), len(re.Key))
 
 		if c := f.state.keyEpoch[shadowKey]; c.Epoch > re.Epoch {
@@ -234,7 +219,7 @@ func (f *dpxFSM) detectConflict(proposal *dpx.Proposal, shadow map[string]engine
 	return false
 }
 
-func (f *dpxFSM) applyProposal(index uint64, proposal *dpx.Proposal, shadow map[string]engine.EpochRecord) error {
+func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow map[string]engine.EpochRecord) error {
 	start := time.Now()
 
 	batch := f.engine.NewBatch()
@@ -245,13 +230,13 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *dpx.Proposal, shadow map[
 	var appliedBuf [8]byte
 
 	for _, w := range proposal.Writes {
-		isCredit := w.Op == dpx.OpCredit
+		isCredit := w.Op == shared.OpCredit
 		switch w.Op {
-		case dpx.OpSet:
+		case shared.OpSet:
 			batch.Set(w.Key, w.Value)
-		case dpx.OpDelete:
+		case shared.OpDelete:
 			batch.Delete(w.Key)
-		case dpx.OpCredit, dpx.OpDebit:
+		case shared.OpCredit, shared.OpDebit:
 			batch.Merge(w.Key, w.Value)
 		default:
 			return fmt.Errorf("dpx/raft: unknown WriteOp %d at index %d", w.Op, index)
@@ -260,21 +245,19 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *dpx.Proposal, shadow map[
 		er := engine.EpochRecord{Epoch: index, IsCredit: isCredit}
 		batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
 
-		// unsafe.String safe: w.Key is in log.Data which outlives applyBatch.
 		shadow[unsafe.String(unsafe.SliceData(w.Key), len(w.Key))] = er
-
-		// Must allocate: Raft may reuse log.Data after Apply returns.
 		f.state.keyEpoch[string(w.Key)] = er
 	}
 
 	batch.Set(appliedKey, encodeUint64(index, appliedBuf[:]))
 
-	if err := f.engine.ApplyBatch(batch, engine.WriteOptions{Sync: f.syncPolicy == dpx.SyncFull}); err != nil {
+	wo := engine.WriteOptions{Sync: f.syncPolicy == shared.SyncFull}
+	if err := f.engine.ApplyBatch(batch, wo); err != nil {
 		return err
 	}
 	f.state.applied = index
 
-	if f.syncPolicy == dpx.SyncBatch {
+	if f.syncPolicy == shared.SyncBatch {
 		if err := f.engine.Sync(); err != nil {
 			return fmt.Errorf("dpx/raft: WAL sync at index %d: %w", index, err)
 		}
@@ -286,9 +269,6 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *dpx.Proposal, shadow map[
 	return nil
 }
 
-// Snapshot implements hraft.FSM. Must return quickly — Apply is blocked while
-// it runs. The actual streaming happens in dpxFSMSnapshot.Persist which runs
-// concurrently with Apply.
 func (f *dpxFSM) Snapshot() (hraft.FSMSnapshot, error) {
 	dir := filepath.Join(
 		f.engine.DataDir(),
@@ -300,11 +280,10 @@ func (f *dpxFSM) Snapshot() (hraft.FSMSnapshot, error) {
 	return &dpxFSMSnapshot{dir: dir, metrics: f.metrics}, nil
 }
 
-// Restore implements hraft.FSM. Not called concurrently with Apply.
 func (f *dpxFSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 	if f.metrics != nil {
-		defer f.metrics.SnapshotRecoverTotal.Add(1)
+		f.metrics.SnapshotRecoverTotal.Add(1)
 	}
 	dir := f.engine.DataDir()
 	if err := f.engine.Close(); err != nil {
@@ -323,16 +302,14 @@ func (f *dpxFSM) Restore(rc io.ReadCloser) error {
 	return err
 }
 
-// dpxFSMSnapshot
-
 type dpxFSMSnapshot struct {
 	dir     string
-	metrics *dpx.Metrics
+	metrics *shared.Metrics
 }
 
 func (s *dpxFSMSnapshot) Persist(sink hraft.SnapshotSink) error {
 	if s.metrics != nil {
-		defer s.metrics.SnapshotSaveTotal.Add(1)
+		s.metrics.SnapshotSaveTotal.Add(1)
 	}
 	if err := tarDir(s.dir, sink); err != nil {
 		sink.Cancel()

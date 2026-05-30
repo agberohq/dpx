@@ -1,95 +1,100 @@
 package dpx
 
 import (
-	"sync/atomic"
 	"time"
 
 	"github.com/agberohq/dpx/engine"
+	"github.com/agberohq/dpx/shared"
 	"github.com/olekukonko/ll"
 )
 
-// SyncPolicy controls WAL durability on each committed Raft entry.
-type SyncPolicy int
+// SyncPolicy controls WAL durability. Alias of shared.SyncPolicy so callers
+// use dpx.SyncBatch etc. without importing internal/shared.
+type SyncPolicy = shared.SyncPolicy
 
 const (
-	// SyncBatch fsyncs once per committed entry via engine.Sync().
-	// Recommended default. Zero value so Config{} is safe without explicit set.
-	SyncBatch SyncPolicy = iota
-
-	// SyncFull fsyncs inside every engine.ApplyBatch call.
-	// Maximum single-node durability; lowest throughput.
-	SyncFull
-
-	// SyncNone skips all fsyncs. Maximum throughput; local data loss on crash.
-	// Raft quorum still provides replication safety across the cluster.
-	SyncNone
+	SyncBatch = shared.SyncBatch
+	SyncFull  = shared.SyncFull
+	SyncNone  = shared.SyncNone
 )
 
-// BatchConfig controls the adaptive flush delay.
+// Metrics is the shared atomic counter struct. Alias so callers use dpx.Metrics.
+type Metrics = shared.Metrics
+
+// BatchConfig controls the adaptive flush delay in the Batcher.
 type BatchConfig struct {
-	MaxEntries int           // default: 256
-	MaxBytes   int64         // default: 4 MiB
-	MinAge     time.Duration // default: 50µs
-	MaxAge     time.Duration // default: 2ms
-	EMAAlpha   float64       // default: 0.1
-	K          float64       // default: 8.0
+	MaxEntries int
+	MaxBytes   int64
+	MinAge     time.Duration
+	MaxAge     time.Duration
+	EMAAlpha   float64
+	K          float64
 }
 
 // RetryConfig controls jack.Retry for OCC conflict retries.
 type RetryConfig struct {
-	MaxAttempts int           // default: 50
-	BaseDelay   time.Duration // default: 1ms
-	MaxDelay    time.Duration // default: 100ms
-	Multiplier  float64       // default: 2.0
+	MaxAttempts int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
+	Multiplier  float64
 }
 
-// Metrics holds atomic counters. Pass a non-nil *Metrics to Config to enable.
-type Metrics struct {
-	ConflictTotal        atomic.Uint64
-	ConflictExhausted    atomic.Uint64
-	WatchDropped         atomic.Uint64
-	SnapshotSaveTotal    atomic.Uint64
-	SnapshotRecoverTotal atomic.Uint64
-	BackupTotal          atomic.Uint64
-
-	ApplyDurationNs           atomic.Int64
-	RaftCommitDurationNs      atomic.Int64
-	KeyEpochRebuildDurationNs atomic.Int64
-}
-
-// Config is passed to Open(). Engine is the only required field.
+// Config is passed to dpx.Open. Engine is the only required field.
 type Config struct {
-	// NodeID identifies this node in the Raft cluster. Default: "1".
-	// Must be unique and stable across restarts.
 	NodeID string
-
-	// Engine is the storage backend. Required.
 	Engine engine.StorageEngine
 
-	// SyncPolicy controls WAL durability. Default: SyncBatch (zero value).
 	SyncPolicy SyncPolicy
 
-	// Network — leave empty for single-node embedded mode (no TCP socket opened).
-	// ListenAddr is the Raft RPC address, e.g. "0.0.0.0:7001".
-	// Peers maps NodeID → "host:port" for the initial cluster bootstrap.
+	// Network — leave empty for single-node embedded mode (uses in-memory transport).
+	// Set ListenAddr + Peers for a multi-node cluster (uses TCP transport + BoltDB).
 	ListenAddr string
 	Peers      map[string]string
+	RaftDir    string
 
-	// RaftDir is where the Raft implementation stores its log and stable state.
-	// Defaults to os.TempDir()/dpx-{NodeID}.
-	RaftDir string
-
-	// Tuning.
-	Batch BatchConfig
-	Retry RetryConfig
-
-	// ShutdownTimeout is the max time jack.Shutdown waits for teardown.
-	// Default: 30s.
+	Batch           BatchConfig
+	Retry           RetryConfig
 	ShutdownTimeout time.Duration
 
-	// Observability. nil = no collection.
 	Metrics *Metrics
-	Logger  *ll.Logger
+
+	// Logger is the parent application's logger (e.g. Teller's ll.Logger).
+	// Raft internals write to it. nil = discard.
+	Logger *ll.Logger
+}
+
+// toShared builds the shared.Config for ProposerFactory.
+// No type conversions needed — SyncPolicy is an alias, Metrics is an alias.
+func (c Config) toShared() shared.Config {
+	return shared.Config{
+		NodeID:          c.NodeID,
+		ListenAddr:      c.ListenAddr,
+		Peers:           c.Peers,
+		RaftDir:         c.RaftDir,
+		Engine:          c.Engine,
+		SyncPolicy:      c.SyncPolicy,
+		ShutdownTimeout: c.ShutdownTimeout,
+		Metrics:         c.Metrics,
+		Logger:          llWriter(c.Logger),
+	}
+}
+
+func llWriter(logger *ll.Logger) interface{ Write([]byte) (int, error) } {
+	if logger == nil {
+		return noopWriter{}
+	}
+	return &llWriterAdapter{l: logger}
+}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type llWriterAdapter struct{ l *ll.Logger }
+
+func (w *llWriterAdapter) Write(p []byte) (n int, err error) {
+	w.l.Info(string(p))
+	return len(p), nil
 }
 
 func applyDefaults(cfg *Config) {

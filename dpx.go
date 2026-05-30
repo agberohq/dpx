@@ -1,19 +1,5 @@
 // Package dpx provides a strictly-serializable embedded key-value store
 // backed by Raft consensus and Pebble storage.
-//
-// The Raft implementation lives in the raft/ subdirectory. This package
-// contains everything that is independent of the Raft library: the
-// transaction model, batching, watchers, encoding, and the public API.
-//
-//	node, err := dpx.Open(cfg, dpxraft.Open)
-//	if err != nil { log.Fatal(err) }
-//	defer node.Close()
-//
-//	err = node.RunInTx(ctx, func(tx dpx.KVTx) error {
-//	    val, err := tx.Get(ctx, []byte("key"))
-//	    if err != nil { return err }
-//	    return tx.Set(ctx, []byte("key"), newVal)
-//	})
 package dpx
 
 import (
@@ -24,35 +10,11 @@ import (
 	"time"
 
 	"github.com/agberohq/dpx/engine"
+	"github.com/agberohq/dpx/shared"
+	"github.com/olekukonko/hlc"
 	"github.com/olekukonko/jack"
 	"github.com/vmihailenco/msgpack/v5"
 )
-
-// Proposer is the interface the raft/ package satisfies.
-// Node calls Propose for every committed RunInTx attempt.
-// The interface keeps the root package free of any Raft library import.
-type Proposer interface {
-	Propose(data []byte) (ApplyResult, error)
-	Shutdown() error
-}
-
-// ApplyResult is the value the FSM returns to the proposing goroutine.
-// Exported so raft/ can construct it without an import cycle.
-type ApplyResult struct {
-	Conflict bool  // OCC conflict detected; Node maps this to ErrConflict
-	Err      error // fatal FSM error; surfaced directly to the caller
-}
-
-// WatchNotifier is the interface the watcherMap satisfies.
-// Exported so raft/fsm.go can call NotifyBatch without importing watch.go
-// internals.
-type WatchNotifier interface {
-	NotifyBatch(writes []WriteEntry, metrics *Metrics)
-}
-
-// ProposerFactory is the function signature callers pass to Open.
-// Typically: dpxraft.Open
-type ProposerFactory func(cfg Config, eng engine.StorageEngine, w WatchNotifier) (Proposer, error)
 
 // KVStore is the public interface exposed by a DPX Node.
 type KVStore interface {
@@ -77,13 +39,14 @@ type KVTx interface {
 
 // Node is a DPX consensus node. Safe for concurrent use after Open().
 type Node struct {
-	proposer Proposer
+	proposer shared.Proposer
 	engine   engine.StorageEngine
 	batcher  *Batcher
 	retry    *jack.Retry
 	shutdown *jack.Shutdown
 	watchers *watcherMap
 	metrics  *Metrics
+	clock    *hlc.Clock
 	closed   atomic.Bool
 }
 
@@ -93,7 +56,7 @@ type Node struct {
 //
 //	import dpxraft "github.com/agberohq/dpx/raft"
 //	node, err := dpx.Open(cfg, dpxraft.Open)
-func Open(cfg Config, newProposer ProposerFactory) (*Node, error) {
+func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 	if cfg.Engine == nil {
 		return nil, fmt.Errorf("dpx: Config.Engine is required")
 	}
@@ -105,7 +68,8 @@ func Open(cfg Config, newProposer ProposerFactory) (*Node, error) {
 
 	watchers := newWatcherMap()
 
-	proposer, err := newProposer(cfg, cfg.Engine, watchers)
+	sharedCfg := cfg.toShared()
+	proposer, err := newProposer(sharedCfg, cfg.Engine, watchers)
 	if err != nil {
 		cfg.Engine.Close()
 		return nil, fmt.Errorf("dpx: proposer: %w", err)
@@ -119,6 +83,7 @@ func Open(cfg Config, newProposer ProposerFactory) (*Node, error) {
 		batcher:  batcher,
 		watchers: watchers,
 		metrics:  cfg.Metrics,
+		clock:    hlc.NewClock(),
 	}
 
 	n.retry = jack.NewRetry(
@@ -137,15 +102,9 @@ func Open(cfg Config, newProposer ProposerFactory) (*Node, error) {
 		}),
 	)
 
-	// Shutdown priority:
-	//   0: stop Raft — no new Propose calls after this
-	//   1: close watchers — safe once Raft is stopped
-	//   2: close engine — Pebble flush + close
 	sd := jack.NewShutdown(jack.ShutdownWithTimeout(cfg.ShutdownTimeout))
 	mustRegister := func(name string, pri int, fn func(context.Context) error) {
 		if err := sd.RegisterWithPriority(name, pri, fn); err != nil {
-			// RegisterWithPriority only fails if Shutdown already triggered;
-			// that can't happen here since we just created sd.
 			panic(fmt.Sprintf("dpx: register shutdown %q: %v", name, err))
 		}
 	}
@@ -158,8 +117,6 @@ func Open(cfg Config, newProposer ProposerFactory) (*Node, error) {
 }
 
 // RunInTx executes fn in a strictly-serializable transaction.
-// Retries automatically on OCC conflicts up to RetryConfig.MaxAttempts.
-// fn must be idempotent.
 func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 	if n.closed.Load() {
 		return ErrStoreClosed
@@ -176,22 +133,20 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 	return err
 }
 
-// In runOnce method:
 func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	snap, err := n.engine.GetSnapshot()
 	if err != nil {
 		return fmt.Errorf("dpx: GetSnapshot: %w", err)
 	}
-	defer snap.Close() // Moved defer before fn call
+	defer snap.Close()
 
 	tx := &dpxTx{
 		snap:    snap,
-		readSet: make(map[string]ReadEntry, 8),
-		writes:  make([]WriteEntry, 0, 8),
+		readSet: make(map[string]shared.ReadEntry, 8),
+		writes:  make([]shared.WriteEntry, 0, 8),
 	}
 
 	fnErr := fn(tx)
-	// snap.Close() removed from here
 
 	if fnErr != nil {
 		return fnErr
@@ -203,9 +158,12 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 		return err
 	}
 
-	data, err := msgpack.Marshal(&Proposal{
-		ReadSet: tx.readSetSlice(),
-		Writes:  tx.writes,
+	ts := n.clock.Tick()
+	data, err := msgpack.Marshal(&shared.Proposal{
+		ReadSet:          tx.readSetSlice(),
+		Writes:           tx.writes,
+		TimestampWall:    ts.Wall,
+		TimestampCounter: ts.Counter,
 	})
 	if err != nil {
 		return fmt.Errorf("dpx: marshal: %w", err)
@@ -267,9 +225,9 @@ func (n *Node) WatchKey(ctx context.Context, prefix []byte) (<-chan struct{}, er
 	return n.watchers.register(ctx, string(prefix)), nil
 }
 
-// GetDatabaseTime returns the current wall-clock time. Advisory only.
+// GetDatabaseTime returns the current HLC timestamp as a physical time.Time.
 func (n *Node) GetDatabaseTime(_ context.Context) (time.Time, error) {
-	return time.Now(), nil
+	return n.clock.Now().Physical(), nil
 }
 
 // GetSafeReadPoint returns the last Raft log index applied to this node.
@@ -299,7 +257,7 @@ func (n *Node) SetBatchConfig(cfg BatchConfig) {
 	n.batcher.SetConfig(cfg)
 }
 
-// Close gracefully shuts down the node (Raft → watchers → engine).
+// Close gracefully shuts down the node (Raft -> watchers -> engine).
 func (n *Node) Close() error {
 	if !n.closed.CompareAndSwap(false, true) {
 		return nil

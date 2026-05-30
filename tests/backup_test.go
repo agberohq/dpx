@@ -13,7 +13,8 @@ import (
 func TestBackup(t *testing.T) {
 	eng := memory.New()
 	cfg := dpx.Config{
-		Engine: eng,
+		Engine:  eng,
+		RaftDir: t.TempDir(),
 	}
 
 	node, err := dpx.Open(cfg, dpxraft.Open)
@@ -35,7 +36,6 @@ func TestBackup(t *testing.T) {
 		t.Fatalf("Backup: %v", err)
 	}
 
-	// Verify backup created
 	if _, err := os.Stat(dir); err != nil {
 		t.Errorf("backup dir stat: %v", err)
 	}
@@ -44,7 +44,8 @@ func TestBackup(t *testing.T) {
 func TestBackupOnClosedNode(t *testing.T) {
 	eng := memory.New()
 	cfg := dpx.Config{
-		Engine: eng,
+		Engine:  eng,
+		RaftDir: t.TempDir(),
 	}
 
 	node, err := dpx.Open(cfg, dpxraft.Open)

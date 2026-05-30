@@ -20,6 +20,7 @@ import (
 
 	"github.com/agberohq/dpx"
 	"github.com/agberohq/dpx/engine/pebble"
+	dpxraft "github.com/agberohq/dpx/raft"
 )
 
 func main() {
@@ -57,7 +58,7 @@ func runBackup(args []string) {
 
 	n, err := dpx.Open(dpx.Config{
 		Engine: pebble.New(*dataDir),
-	})
+	}, dpxraft.Open)
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}

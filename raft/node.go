@@ -8,181 +8,213 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/agberohq/dpx"
 	"github.com/agberohq/dpx/engine"
-	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb"
+	"github.com/agberohq/dpx/shared"
+	hraft "github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/olekukonko/hlc"
 )
 
-// Node implements dpx.Proposer using Hashicorp's Raft library.
+// Node implements shared.Proposer using HashiCorp Raft.
 type Node struct {
-	raft          *raft.Raft
-	fsm           *fsm
-	transport     raft.Transport
-	logDB         *raftboltdb.BoltStore
-	stableDB      *raftboltdb.BoltStore
-	snapshotStore raft.SnapshotStore
-	dir           string
+	raft      *hraft.Raft
+	fsm       *dpxFSM
+	transport hraft.Transport
+	logDB     io.Closer // *raftboltdb.BoltStore or nil (inmem)
+	stableDB  io.Closer // *raftboltdb.BoltStore or nil (inmem)
+	dir       string
 }
 
-// Open creates a new Raft node and returns it as a dpx.Proposer.
-func Open(cfg dpx.Config, eng engine.StorageEngine, w dpx.WatchNotifier) (dpx.Proposer, error) {
+// Open creates a Raft node. Single-node embedded mode (empty Peers) uses
+// in-memory transport and log/stable stores — no TCP, no BoltDB, no disk I/O
+// on the Raft path. Multi-node sets ListenAddr + Peers and uses TCP + BoltDB.
+func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (shared.Proposer, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = "1"
 	}
-	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = "127.0.0.1:0"
-	}
 
-	raftDir := cfg.RaftDir
-	if raftDir == "" {
-		raftDir = filepath.Join(os.TempDir(), "dpx-"+cfg.NodeID)
-	}
-
-	if err := os.MkdirAll(raftDir, 0755); err != nil {
-		return nil, fmt.Errorf("raft: mkdir %s: %w", raftDir, err)
-	}
-
-	// Setup Raft configuration.
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(cfg.NodeID)
+	rCfg := hraft.DefaultConfig()
+	rCfg.LocalID = hraft.ServerID(cfg.NodeID)
 	if cfg.Logger != nil {
-		config.LogOutput = cfg.Logger.Writer()
+		rCfg.LogOutput = cfg.Logger
 	} else {
-		config.LogOutput = io.Discard
+		rCfg.LogOutput = io.Discard
 	}
 
-	// Create the FSM.
-	f := newFSM(eng, w)
-
-	// Create log and stable stores.
-	logDB, err := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft-log.db"))
-	if err != nil {
-		return nil, fmt.Errorf("raft: new log store: %w", err)
+	// FSM owns its own HLC clock — no shared.Clock interface needed.
+	clock := hlc.NewClock()
+	f := newFSM(eng, cfg.SyncPolicy, w, cfg.Metrics, clock)
+	if _, err := f.open(nil); err != nil {
+		return nil, fmt.Errorf("raft: fsm open: %w", err)
 	}
 
-	stableDB, err := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft-stable.db"))
+	snapDir, err := snapshotDir(cfg)
 	if err != nil {
-		logDB.Close()
-		return nil, fmt.Errorf("raft: new stable store: %w", err)
+		return nil, fmt.Errorf("raft: snapshot dir: %w", err)
 	}
-
-	// Create snapshot store.
-	snapshotStore, err := raft.NewFileSnapshotStore(raftDir, 3, os.Stderr)
+	snap, err := hraft.NewFileSnapshotStore(snapDir, 3, io.Discard)
 	if err != nil {
-		stableDB.Close()
-		logDB.Close()
 		return nil, fmt.Errorf("raft: snapshot store: %w", err)
 	}
 
-	// Setup transport.
-	addr, err := net.ResolveTCPAddr("tcp", cfg.ListenAddr)
-	if err != nil {
-		snapshotStore.Close()
-		stableDB.Close()
-		logDB.Close()
-		return nil, fmt.Errorf("raft: resolve addr: %w", err)
+	embedded := len(cfg.Peers) == 0
+
+	var (
+		transport    hraft.Transport
+		logStore     hraft.LogStore
+		stableStore  hraft.StableStore
+		logCloser    io.Closer
+		stableCloser io.Closer
+	)
+
+	if embedded {
+		// ── Embedded single-node: fully in-memory, no network, no BoltDB ──
+		_, transport = hraft.NewInmemTransport("")
+		logStore = hraft.NewInmemStore()
+		stableStore = hraft.NewInmemStore()
+	} else {
+		// ── Multi-node: TCP transport + BoltDB persistent stores ──
+		listenAddr := cfg.ListenAddr
+		if listenAddr == "" {
+			listenAddr = "127.0.0.1:0"
+		}
+		addr, err := net.ResolveTCPAddr("tcp", listenAddr)
+		if err != nil {
+			return nil, fmt.Errorf("raft: resolve addr: %w", err)
+		}
+		t, tErr := hraft.NewTCPTransport(listenAddr, addr, 3, 10*time.Second, io.Discard)
+		if tErr != nil {
+			return nil, fmt.Errorf("raft: transport: %w", tErr)
+		}
+		transport = t
+
+		raftDir := cfg.RaftDir
+		if raftDir == "" {
+			raftDir = filepath.Join(os.TempDir(), "dpx-"+cfg.NodeID)
+		}
+		if err := os.MkdirAll(raftDir, 0755); err != nil {
+			if c, ok := transport.(io.Closer); ok {
+				c.Close()
+			}
+			return nil, fmt.Errorf("raft: mkdir: %w", err)
+		}
+
+		lb, lErr := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft-log.db"))
+		if lErr != nil {
+			if c, ok := transport.(io.Closer); ok {
+				c.Close()
+			}
+			return nil, fmt.Errorf("raft: log store: %w", lErr)
+		}
+		sb, sErr := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft-stable.db"))
+		if sErr != nil {
+			lb.Close()
+			if c, ok := transport.(io.Closer); ok {
+				c.Close()
+			}
+			return nil, fmt.Errorf("raft: stable store: %w", sErr)
+		}
+		logStore = lb
+		stableStore = sb
+		logCloser = lb
+		stableCloser = sb
 	}
 
-	transport, err := raft.NewTCPTransport(cfg.ListenAddr, addr, 3, 10*time.Second, os.Stderr)
+	r, err := hraft.NewRaft(rCfg, f, logStore, stableStore, snap, transport)
 	if err != nil {
-		snapshotStore.Close()
-		stableDB.Close()
-		logDB.Close()
-		return nil, fmt.Errorf("raft: transport: %w", err)
-	}
-
-	// Create Raft node.
-	r, err := raft.NewRaft(config, f, logDB, stableDB, snapshotStore, transport)
-	if err != nil {
-		transport.Close()
-		snapshotStore.Close()
-		stableDB.Close()
-		logDB.Close()
+		if c, ok := transport.(io.Closer); ok {
+			c.Close()
+		}
+		if logCloser != nil {
+			logCloser.Close()
+		}
+		if stableCloser != nil {
+			stableCloser.Close()
+		}
 		return nil, fmt.Errorf("raft: new raft: %w", err)
 	}
 
-	// Bootstrap if peers are configured.
-	if len(cfg.Peers) > 0 {
-		servers := make([]raft.Server, 0, len(cfg.Peers))
+	// Bootstrap.
+	var servers []hraft.Server
+	if embedded {
+		servers = []hraft.Server{{
+			ID:      rCfg.LocalID,
+			Address: transport.LocalAddr(),
+		}}
+	} else {
 		for id, addr := range cfg.Peers {
-			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(id),
-				Address: raft.ServerAddress(addr),
+			servers = append(servers, hraft.Server{
+				ID:      hraft.ServerID(id),
+				Address: hraft.ServerAddress(addr),
 			})
 		}
-		configuration := raft.Configuration{Servers: servers}
-		r.BootstrapCluster(configuration)
+	}
+	r.BootstrapCluster(hraft.Configuration{Servers: servers})
+
+	// Wait for leader election. Single-node: ~few ms. Multi-node: up to 5s timeout.
+	select {
+	case <-r.LeaderCh():
+	case <-time.After(5 * time.Second):
 	}
 
 	return &Node{
-		raft:          r,
-		fsm:           f,
-		transport:     transport,
-		logDB:         logDB,
-		stableDB:      stableDB,
-		snapshotStore: snapshotStore,
-		dir:           raftDir,
+		raft:      r,
+		fsm:       f,
+		transport: transport,
+		logDB:     logCloser,
+		stableDB:  stableCloser,
 	}, nil
 }
 
-// Propose submits a command to the Raft cluster and waits for it to be applied.
-func (n *Node) Propose(data []byte) (dpx.ApplyResult, error) {
-	if n.raft.State() != raft.Leader {
-		return dpx.ApplyResult{}, dpx.ErrNotLeader
+func snapshotDir(cfg shared.Config) (string, error) {
+	if cfg.RaftDir != "" {
+		if err := os.MkdirAll(cfg.RaftDir, 0755); err != nil {
+			return "", err
+		}
+		return cfg.RaftDir, nil
 	}
+	// Embedded mode: unique temp dir per node instance.
+	dir, err := os.MkdirTemp("", "dpx-snap-"+cfg.NodeID+"-*")
+	return dir, err
+}
 
+func (n *Node) Propose(data []byte) (shared.ApplyResult, error) {
+	if n.raft.State() != hraft.Leader {
+		return shared.ApplyResult{}, fmt.Errorf("dpx/raft: not the leader")
+	}
 	future := n.raft.Apply(data, 10*time.Second)
 	if err := future.Error(); err != nil {
-		return dpx.ApplyResult{}, fmt.Errorf("raft: apply: %w", err)
+		return shared.ApplyResult{}, fmt.Errorf("raft: apply: %w", err)
 	}
-
 	resp := future.Response()
-	result, ok := resp.(dpx.ApplyResult)
+	result, ok := resp.(shared.ApplyResult)
 	if !ok {
-		return dpx.ApplyResult{}, fmt.Errorf("raft: unexpected response type: %T", resp)
+		return shared.ApplyResult{}, fmt.Errorf("raft: unexpected response type: %T", resp)
 	}
 	return result, nil
 }
 
-// Shutdown gracefully stops the Raft node and cleans up resources.
 func (n *Node) Shutdown() error {
-	// Shutdown Raft.
-	future := n.raft.Shutdown()
-	if err := future.Error(); err != nil {
+	if err := n.raft.Shutdown().Error(); err != nil {
 		return fmt.Errorf("raft: shutdown: %w", err)
 	}
-
-	// Close transport using io.Closer interface if available.
 	if closer, ok := n.transport.(io.Closer); ok {
-		if err := closer.Close(); err != nil {
-			return fmt.Errorf("raft: transport close: %w", err)
-		}
+		closer.Close()
 	}
-
-	// Close snapshot store.
-	if err := n.snapshotStore.Close(); err != nil {
-		return fmt.Errorf("raft: snapshot store close: %w", err)
+	if n.stableDB != nil {
+		n.stableDB.Close()
 	}
-
-	// Close databases.
-	if err := n.stableDB.Close(); err != nil {
-		return fmt.Errorf("raft: stable store close: %w", err)
+	if n.logDB != nil {
+		n.logDB.Close()
 	}
-	if err := n.logDB.Close(); err != nil {
-		return fmt.Errorf("raft: log store close: %w", err)
-	}
-
 	return nil
 }
 
-// Leader returns the current leader's address.
 func (n *Node) Leader() string {
 	_, id := n.raft.LeaderWithID()
 	return string(id)
 }
 
-// State returns the current Raft state.
 func (n *Node) State() string {
 	return n.raft.State().String()
 }

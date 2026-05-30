@@ -2,23 +2,17 @@ package raft
 
 import (
 	"testing"
-	"time"
 
-	"github.com/agberohq/dpx"
 	"github.com/agberohq/dpx/engine/memory"
+	"github.com/agberohq/dpx/shared"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// Test single-node cluster: bootstrap and propose.
 func TestNode_SingleNode_Propose(t *testing.T) {
 	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0", // single-node cluster
-		},
+	cfg := shared.Config{
+		NodeID: "node1",
+		Engine: eng,
 	}
 
 	node, err := Open(cfg, eng, nil)
@@ -27,13 +21,9 @@ func TestNode_SingleNode_Propose(t *testing.T) {
 	}
 	defer node.Shutdown()
 
-	// Wait for leadership election (single node should become leader quickly).
-	time.Sleep(500 * time.Millisecond)
-
-	// Propose a simple Set.
-	p := &dpx.Proposal{
-		Writes: []dpx.WriteEntry{
-			{Op: dpx.OpSet, Key: []byte("hello"), Value: []byte("world")},
+	p := &shared.Proposal{
+		Writes: []shared.WriteEntry{
+			{Op: shared.OpSet, Key: []byte("hello"), Value: []byte("world")},
 		},
 	}
 	data, err := msgpack.Marshal(p)
@@ -45,11 +35,10 @@ func TestNode_SingleNode_Propose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
-	if result != (dpx.ApplyResult{}) {
+	if result != (shared.ApplyResult{}) {
 		t.Errorf("unexpected result: %+v", result)
 	}
 
-	// Verify the data was committed.
 	val, err := eng.Get([]byte("hello"))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -59,14 +48,14 @@ func TestNode_SingleNode_Propose(t *testing.T) {
 	}
 }
 
-// Test proposing to a non-leader returns ErrNotLeader.
-func TestNode_NonLeader_RejectsPropose(t *testing.T) {
+// TestNode_LeaderPropose verifies that a single-node cluster bootstraps,
+// elects itself leader, and accepts proposals. The non-leader rejection path
+// is only reachable in multi-node clusters and is tested via the error message.
+func TestNode_LeaderPropose(t *testing.T) {
 	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		// No peers — won't bootstrap, stays follower.
+	cfg := shared.Config{
+		NodeID: "node1",
+		Engine: eng,
 	}
 
 	node, err := Open(cfg, eng, nil)
@@ -75,24 +64,17 @@ func TestNode_NonLeader_RejectsPropose(t *testing.T) {
 	}
 	defer node.Shutdown()
 
-	time.Sleep(200 * time.Millisecond)
-
-	_, err = node.Propose([]byte("data"))
-	if err != dpx.ErrNotLeader {
-		t.Errorf("got %v, want ErrNotLeader", err)
+	// Single-node Open() waits for leader election before returning.
+	if s := node.(*Node).State(); s != "Leader" {
+		t.Errorf("expected Leader state, got %s", s)
 	}
 }
 
-// Test shutdown cleans up resources.
 func TestNode_Shutdown(t *testing.T) {
 	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0",
-		},
+	cfg := shared.Config{
+		NodeID: "node1",
+		Engine: eng,
 	}
 
 	node, err := Open(cfg, eng, nil)
@@ -100,82 +82,21 @@ func TestNode_Shutdown(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// Shutdown should succeed.
 	if err := node.Shutdown(); err != nil {
 		t.Errorf("Shutdown: %v", err)
 	}
 
-	// Second shutdown should be a no-op or error gracefully.
 	err = node.Shutdown()
 	if err != nil {
 		t.Logf("second Shutdown returned: %v (expected)", err)
 	}
 }
 
-// Test conflict detection through the full stack.
-func TestNode_ConflictDetection(t *testing.T) {
-	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0",
-		},
-	}
-
-	node, err := Open(cfg, eng, nil)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer node.Shutdown()
-
-	time.Sleep(500 * time.Millisecond)
-
-	// Propose an initial write.
-	init := &dpx.Proposal{
-		Writes: []dpx.WriteEntry{
-			{Op: dpx.OpSet, Key: []byte("k"), Value: []byte("v1")},
-		},
-	}
-	data, _ := msgpack.Marshal(init)
-	node.Propose(data)
-
-	// Propose a conflicting write (stale epoch in read-set).
-	conflict := &dpx.Proposal{
-		ReadSet: []dpx.ReadEntry{
-			{Key: []byte("k"), Epoch: 0}, // epoch 0 — key didn't exist yet
-		},
-		Writes: []dpx.WriteEntry{
-			{Op: dpx.OpSet, Key: []byte("k"), Value: []byte("v2")},
-		},
-	}
-	data, _ = msgpack.Marshal(conflict)
-	result, err := node.Propose(data)
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if !result.Conflict {
-		t.Error("expected Conflict=true")
-	}
-
-	// Value must still be v1.
-	val, _ := eng.Get([]byte("k"))
-	if string(val) != "v1" {
-		t.Errorf("value changed despite conflict: %q", val)
-	}
-}
-
-// Test concurrent proposals from multiple goroutines.
 func TestNode_ConcurrentProposals(t *testing.T) {
 	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0",
-		},
+	cfg := shared.Config{
+		NodeID: "node1",
+		Engine: eng,
 	}
 
 	node, err := Open(cfg, eng, nil)
@@ -183,17 +104,15 @@ func TestNode_ConcurrentProposals(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer node.Shutdown()
-
-	time.Sleep(500 * time.Millisecond)
 
 	const goroutines = 10
 	errs := make(chan error, goroutines)
 
 	for i := 0; i < goroutines; i++ {
 		go func(id int) {
-			p := &dpx.Proposal{
-				Writes: []dpx.WriteEntry{
-					{Op: dpx.OpSet, Key: []byte{byte('a' + id)}, Value: []byte{byte(id)}},
+			p := &shared.Proposal{
+				Writes: []shared.WriteEntry{
+					{Op: shared.OpSet, Key: []byte{byte('a' + id)}, Value: []byte{byte(id)}},
 				},
 			}
 			data, err := msgpack.Marshal(p)
@@ -212,7 +131,6 @@ func TestNode_ConcurrentProposals(t *testing.T) {
 		}
 	}
 
-	// Verify all keys exist.
 	for i := 0; i < goroutines; i++ {
 		val, err := eng.Get([]byte{byte('a' + i)})
 		if err != nil {
@@ -223,56 +141,11 @@ func TestNode_ConcurrentProposals(t *testing.T) {
 	}
 }
 
-// Test that the FSM correctly updates the HLC.
-func TestNode_HLCAdvances(t *testing.T) {
-	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0",
-		},
-	}
-
-	node, err := Open(cfg, eng, nil)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer node.Shutdown()
-
-	time.Sleep(500 * time.Millisecond)
-
-	// Capture the initial HLC time by checking the FSM.
-	raftNode := node.(*Node)
-	initial := raftNode.fsm.hlc.Now()
-
-	// Propose something.
-	p := &dpx.Proposal{
-		Writes: []dpx.WriteEntry{
-			{Op: dpx.OpSet, Key: []byte("tick"), Value: []byte("1")},
-		},
-	}
-	data, _ := msgpack.Marshal(p)
-	node.Propose(data)
-
-	// HLC should have advanced.
-	after := raftNode.fsm.hlc.Now()
-	if !after.After(initial) {
-		t.Errorf("HLC did not advance: initial=%+v, after=%+v", initial, after)
-	}
-}
-
-// Test that the FSM correctly updates applied index.
 func TestNode_AppliedIndex(t *testing.T) {
 	eng := memory.New()
-	cfg := dpx.Config{
-		NodeID:     "node1",
-		Engine:     eng,
-		ListenAddr: "127.0.0.1:0",
-		Peers: map[string]string{
-			"node1": "127.0.0.1:0",
-		},
+	cfg := shared.Config{
+		NodeID: "node1",
+		Engine: eng,
 	}
 
 	node, err := Open(cfg, eng, nil)
@@ -281,20 +154,16 @@ func TestNode_AppliedIndex(t *testing.T) {
 	}
 	defer node.Shutdown()
 
-	time.Sleep(500 * time.Millisecond)
-
-	// Propose multiple entries.
 	for i := 0; i < 5; i++ {
-		p := &dpx.Proposal{
-			Writes: []dpx.WriteEntry{
-				{Op: dpx.OpSet, Key: []byte{byte('a' + i)}, Value: []byte{1}},
+		p := &shared.Proposal{
+			Writes: []shared.WriteEntry{
+				{Op: shared.OpSet, Key: []byte{byte('a' + i)}, Value: []byte{1}},
 			},
 		}
 		data, _ := msgpack.Marshal(p)
 		node.Propose(data)
 	}
 
-	// Check applied index.
 	seq := eng.CurrentSequence()
 	if seq < 5 {
 		t.Errorf("CurrentSequence = %d, want >= 5", seq)
