@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"time"
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/cockroachdb/pebble"
@@ -22,14 +23,20 @@ import (
 // Engine is the Pebble-backed StorageEngine.
 // Create with New(dir), then pass to dpx.Open via Config.Engine.
 type Engine struct {
-	db  *pebble.DB
-	dir string
+	db        *pebble.DB
+	dir       string
+	telemetry engine.StageRecorder
 }
 
 // New creates a Pebble engine that stores data in dir.
 // Open must be called before any reads or writes.
 func New(dir string) *Engine {
 	return &Engine{dir: dir}
+}
+
+// SetTelemetry optionally provides a StageRecorder for internal timing.
+func (e *Engine) SetTelemetry(r engine.StageRecorder) {
+	e.telemetry = r
 }
 
 // Open initialises the Pebble database.
@@ -77,7 +84,7 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
 	seq := e.CurrentSequence()
 	snap := e.db.NewSnapshot()
-	return &pebbleSnapshot{snap: snap, seq: seq}, nil
+	return &pebbleSnapshot{snap: snap, seq: seq, telemetry: e.telemetry}, nil
 }
 
 // NewBatch creates a new Pebble write batch.
@@ -142,10 +149,20 @@ func (e *Engine) DataDir() string { return e.dir }
 // The end bound uses 16 × 0xFF bytes to guarantee coverage of any user key
 // byte value, including bytes > 0x7E that would be excluded by "~" (0x7E).
 func (e *Engine) RawIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if e.telemetry != nil {
+		matStart = time.Now()
+	}
+
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: start,
 		UpperBound: end,
 	})
+
+	if e.telemetry != nil {
+		e.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
 	if err != nil {
 		return &errIter{err: err}
 	}
@@ -155,8 +172,9 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 // pebbleSnapshot
 
 type pebbleSnapshot struct {
-	snap *pebble.Snapshot
-	seq  uint64
+	snap      *pebble.Snapshot
+	seq       uint64
+	telemetry engine.StageRecorder
 }
 
 func (s *pebbleSnapshot) Get(key []byte) ([]byte, error) {
@@ -187,10 +205,20 @@ func (s *pebbleSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 }
 
 func (s *pebbleSnapshot) NewIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if s.telemetry != nil {
+		matStart = time.Now()
+	}
+
 	iter, err := s.snap.NewIter(&pebble.IterOptions{
 		LowerBound: start,
 		UpperBound: end,
 	})
+
+	if s.telemetry != nil {
+		s.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
 	if err != nil {
 		return &errIter{err: err}
 	}

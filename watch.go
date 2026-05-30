@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agberohq/dpx/shared"
 )
@@ -12,22 +13,23 @@ const watchChanBuf = 256
 
 // watcherMap manages per-prefix watch channels.
 type watcherMap struct {
-	mu      sync.RWMutex
-	watches map[string][]chan struct{}
-	done    chan struct{}
-	closed  bool
+	mu        sync.RWMutex
+	watches   map[string][]chan struct{}
+	done      chan struct{}
+	closed    bool
+	telemetry *shared.Telemetry // <-- ADDED
 }
 
-func newWatcherMap() *watcherMap {
+func newWatcherMap(telemetry *shared.Telemetry) *watcherMap { // <-- UPDATED
 	return &watcherMap{
-		watches: make(map[string][]chan struct{}),
-		done:    make(chan struct{}),
+		watches:   make(map[string][]chan struct{}),
+		done:      make(chan struct{}),
+		telemetry: telemetry,
 	}
 }
 
 func (w *watcherMap) register(ctx context.Context, prefix string) <-chan struct{} {
 	ch := make(chan struct{}, watchChanBuf)
-
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -36,7 +38,6 @@ func (w *watcherMap) register(ctx context.Context, prefix string) <-chan struct{
 	}
 	w.watches[prefix] = append(w.watches[prefix], ch)
 	w.mu.Unlock()
-
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -56,7 +57,6 @@ func (w *watcherMap) register(ctx context.Context, prefix string) <-chan struct{
 		w.mu.Unlock()
 		close(ch)
 	}()
-
 	return ch
 }
 
@@ -84,8 +84,12 @@ func (w *watcherMap) notify(key string, metrics *Metrics) {
 			continue
 		}
 		for _, ch := range chans {
+			sendStart := time.Now()
 			select {
 			case ch <- struct{}{}:
+				if w.telemetry != nil {
+					w.telemetry.WatchChannelSend.Record(time.Since(sendStart))
+				}
 			default:
 				if metrics != nil {
 					metrics.WatchDropped.Add(1)
@@ -97,16 +101,17 @@ func (w *watcherMap) notify(key string, metrics *Metrics) {
 
 // NotifyBatch satisfies the shared.WatchNotifier interface.
 func (w *watcherMap) NotifyBatch(writes []shared.WriteEntry, metrics *shared.Metrics) {
+	if w.telemetry != nil {
+		defer func(start time.Time) {
+			w.telemetry.WatchNotify.Record(time.Since(start))
+		}(time.Now())
+	}
+
 	if len(w.watches) == 0 {
 		return
 	}
-	// Convert shared.Metrics to dpx.Metrics for notify().
-	// notify() only uses WatchDropped, so we pass nil if no local metrics.
-	var m *Metrics
-	if metrics != nil {
-		m = &Metrics{} // dummy; notify only checks nil and calls Add
-	}
+	// Pass real metrics pointer directly; notify() safely handles nil.
 	for i := range writes {
-		w.notify(string(writes[i].Key), m)
+		w.notify(string(writes[i].Key), metrics)
 	}
 }

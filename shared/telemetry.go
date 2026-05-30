@@ -73,19 +73,62 @@ func (s *StageTimer) Max() time.Duration {
 //
 //	GetSnapshot → fn(tx) → Marshal → Propose → [detectConflict → applyProposal → EngineApply]
 type Telemetry struct {
-	// dpx.go / runOnce stages
-	GetSnapshot StageTimer // engine.GetSnapshot()
-	Speculate   StageTimer // fn(tx) speculative execution
-	Marshal     StageTimer // msgpack.Marshal(proposal)
-	Propose     StageTimer // full proposer.Propose() round-trip
+	// Existing (dpx.go runOnce)
+	GetSnapshot StageTimer
+	Speculate   StageTimer
+	Marshal     StageTimer
+	Propose     StageTimer
 
-	// raft/fsm.go / applyBatch stages (inside Propose)
-	ConflictDetect StageTimer // detectConflict per proposal
-	ApplyProposal  StageTimer // applyProposal per proposal (excludes engine)
-	EngineApply    StageTimer // engine.ApplyBatch per proposal
+	// Existing (raft/fsm.go applyBatch)
+	ConflictDetect StageTimer
+	ApplyProposal  StageTimer
+	EngineApply    StageTimer
 
-	// engine/memory stages (inside EngineApply)
+	// Batcher
+	BatcherWait      StageTimer // Wait() duration
+	BatcherFlushSize StageTimer // batch size distribution
+
+	// Direct Proposer
+	DirectSubmit     StageTimer // submitCh send
+	DirectAccumulate StageTimer // batch accumulation time
+	DirectRoundTrip  StageTimer // ProposeDirect → result
+
+	// Engine internals
+	EngineSync      StageTimer // Sync() call duration
+	SnapshotCreate  StageTimer // GetSnapshot engine call
+	IterMaterialise StageTimer // badger eager copy / pebble NewIter
+
+	// Transaction breakdown
+	TxValidate    StageTimer // validate() call
+	TxReadSetCopy StageTimer // readSetSlice allocation
+	RetryBackoff  StageTimer // total time spent in retry delays
+
+	// Watch
+	WatchNotify      StageTimer // NotifyBatch broadcast
+	WatchChannelSend StageTimer // per-channel send
+
+	// Startup
+	EngineOpen      StageTimer
+	KeyEpochRebuild StageTimer // already have as int64 metric, but timer is useful
+	RaftBootstrap   StageTimer
+
+	// Shutdown
+	ShutdownRaft   StageTimer
+	ShutdownEngine StageTimer
+
 	Clone StageTimer // copy-on-write clone cost
+}
+
+// RecordClone records a clone/copy-on-write duration observation.
+// Satisfies engine.StageRecorder.
+func (t *Telemetry) RecordClone(d time.Duration) {
+	t.Clone.Record(d)
+}
+
+// RecordIterMaterialise records an iterator materialisation duration observation.
+// Satisfies engine.StageRecorder.
+func (t *Telemetry) RecordIterMaterialise(d time.Duration) {
+	t.IterMaterialise.Record(d)
 }
 
 // Print writes a human-readable breakdown to w.
@@ -104,6 +147,24 @@ func (t *Telemetry) Print(w io.Writer) {
 		{"  apply_proposal", &t.ApplyProposal},
 		{"  engine_apply", &t.EngineApply},
 		{"    clone_cow", &t.Clone},
+		{"iter_materialise", &t.IterMaterialise},
+		{"retry_backoff", &t.RetryBackoff},
+		{"tx_validate", &t.TxValidate},
+		{"tx_readset_copy", &t.TxReadSetCopy},
+		{"batcher_wait", &t.BatcherWait},
+		{"batcher_flush_size", &t.BatcherFlushSize},
+		{"direct_submit", &t.DirectSubmit},
+		{"direct_accumulate", &t.DirectAccumulate},
+		{"direct_roundtrip", &t.DirectRoundTrip},
+		{"engine_sync", &t.EngineSync},
+		{"snapshot_create", &t.SnapshotCreate},
+		{"watch_notify", &t.WatchNotify},
+		{"watch_channel_send", &t.WatchChannelSend},
+		{"engine_open", &t.EngineOpen},
+		{"key_epoch_rebuild", &t.KeyEpochRebuild},
+		{"raft_bootstrap", &t.RaftBootstrap},
+		{"shutdown_raft", &t.ShutdownRaft},
+		{"shutdown_engine", &t.ShutdownEngine},
 	}
 	fmt.Fprintf(w, "%-22s %10s %10s %10s %10s\n", "stage", "count", "mean", "min", "max")
 	fmt.Fprintf(w, "%-22s %10s %10s %10s %10s\n",

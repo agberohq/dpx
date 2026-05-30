@@ -10,7 +10,7 @@ import (
 )
 
 func TestWatcher_RegisterAndReceiveNotification(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -25,7 +25,7 @@ func TestWatcher_RegisterAndReceiveNotification(t *testing.T) {
 }
 
 func TestWatcher_PrefixMatchRequired(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -40,7 +40,7 @@ func TestWatcher_PrefixMatchRequired(t *testing.T) {
 }
 
 func TestWatcher_CancelRemovesChannel(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ch := w.register(ctx, "k:")
@@ -67,7 +67,7 @@ func TestWatcher_CancelRemovesChannel(t *testing.T) {
 }
 
 func TestWatcher_MultipleWatchersSamePrefix(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -86,7 +86,7 @@ func TestWatcher_MultipleWatchersSamePrefix(t *testing.T) {
 }
 
 func TestWatcher_DroppedWhenBufferFull(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -118,7 +118,7 @@ func TestWatcher_DroppedWhenBufferFull(t *testing.T) {
 }
 
 func TestWatcher_NotifyBatch_FiresForEachKey(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -147,13 +147,13 @@ func TestWatcher_NotifyBatch_FiresForEachKey(t *testing.T) {
 }
 
 func TestWatcher_NotifyBatch_EmptyWatchesIsNoop(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	writes := []shared.WriteEntry{{Op: shared.OpSet, Key: []byte("k"), Value: []byte("v")}}
 	w.NotifyBatch(writes, nil)
 }
 
 func TestWatcher_ConcurrentRegisterAndNotify(t *testing.T) {
-	w := newWatcherMap()
+	w := newWatcherMap(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

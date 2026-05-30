@@ -22,7 +22,7 @@ func defaultBatchConfig() BatchConfig {
 // Basic Wait behaviour
 
 func TestBatcher_WaitReturnsNilOnTimer(t *testing.T) {
-	b := newBatcher(defaultBatchConfig())
+	b := newBatcher(defaultBatchConfig(), nil)
 	ctx := context.Background()
 
 	start := time.Now()
@@ -42,7 +42,7 @@ func TestBatcher_WaitReturnsCtxErrOnCancel(t *testing.T) {
 	cfg := defaultBatchConfig()
 	cfg.MinAge = 10 * time.Millisecond // long enough to cancel first
 	cfg.MaxAge = 10 * time.Millisecond
-	b := newBatcher(cfg)
+	b := newBatcher(cfg, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
@@ -58,7 +58,7 @@ func TestBatcher_WaitReturnsImmediatelyOnEntryThreshold(t *testing.T) {
 	cfg.MaxEntries = 2
 	cfg.MinAge = 10 * time.Second // would block forever if threshold not hit
 	cfg.MaxAge = 10 * time.Second
-	b := newBatcher(cfg)
+	b := newBatcher(cfg, nil)
 
 	ctx := context.Background()
 
@@ -82,7 +82,7 @@ func TestBatcher_WaitReturnsImmediatelyOnByteThreshold(t *testing.T) {
 	cfg.MaxBytes = 100
 	cfg.MinAge = 10 * time.Second
 	cfg.MaxAge = 10 * time.Second
-	b := newBatcher(cfg)
+	b := newBatcher(cfg, nil)
 
 	ctx := context.Background()
 	b.inBytes.Store(100)
@@ -102,7 +102,7 @@ func TestBatcher_WaitReturnsImmediatelyOnByteThreshold(t *testing.T) {
 // SetConfig (hot-reload)
 
 func TestBatcher_SetConfig_TakesEffect(t *testing.T) {
-	b := newBatcher(defaultBatchConfig())
+	b := newBatcher(defaultBatchConfig(), nil)
 	ctx := context.Background()
 
 	// Change MaxEntries to 1 so next Wait exits immediately via threshold.
@@ -126,7 +126,7 @@ func TestBatcher_SetConfig_TakesEffect(t *testing.T) {
 // inFlight accounting
 
 func TestBatcher_InFlightDecrementedAfterWait(t *testing.T) {
-	b := newBatcher(defaultBatchConfig())
+	b := newBatcher(defaultBatchConfig(), nil)
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -149,7 +149,7 @@ func TestBatcher_InFlightDecrementedOnCancel(t *testing.T) {
 	cfg := defaultBatchConfig()
 	cfg.MinAge = 5 * time.Second
 	cfg.MaxAge = 5 * time.Second
-	b := newBatcher(cfg)
+	b := newBatcher(cfg, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -172,7 +172,7 @@ func TestBatcher_InFlightDecrementedOnCancel(t *testing.T) {
 // EMA adaptation
 
 func TestBatcher_EMAUpdatedOnSuccessiveWaits(t *testing.T) {
-	b := newBatcher(defaultBatchConfig())
+	b := newBatcher(defaultBatchConfig(), nil)
 	ctx := context.Background()
 
 	// Before any Wait: lastAt is zero, EMA stays 0.
@@ -196,7 +196,7 @@ func TestBatcher_EMAUpdatedOnSuccessiveWaits(t *testing.T) {
 // Concurrency
 
 func TestBatcher_ConcurrentWait_NoRace(t *testing.T) {
-	b := newBatcher(defaultBatchConfig())
+	b := newBatcher(defaultBatchConfig(), nil)
 	ctx := context.Background()
 
 	var completed atomic.Int64

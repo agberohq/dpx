@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/dgraph-io/badger/v4"
@@ -31,14 +32,20 @@ import (
 // Engine is the Badger-backed StorageEngine.
 // Create with New(dir), then pass to dpx.Open via Config.Engine.
 type Engine struct {
-	db  *badger.DB
-	dir string
+	db        *badger.DB
+	dir       string
+	telemetry engine.StageRecorder
 }
 
 // New creates a Badger engine that stores data in dir.
 // Open must be called before any reads or writes.
 func New(dir string) *Engine {
 	return &Engine{dir: dir}
+}
+
+// SetTelemetry optionally provides a StageRecorder for internal timing.
+func (e *Engine) SetTelemetry(r engine.StageRecorder) {
+	e.telemetry = r
 }
 
 // Open initialises the Badger database.
@@ -86,7 +93,7 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
 	seq := e.CurrentSequence()
 	txn := e.db.NewTransaction(false) // read-only
-	return &badgerSnapshot{txn: txn, seq: seq}, nil
+	return &badgerSnapshot{txn: txn, seq: seq, telemetry: e.telemetry}, nil
 }
 
 // NewBatch creates a write batch for this engine.
@@ -212,6 +219,11 @@ func (e *Engine) DataDir() string { return e.dir }
 // RawIter returns a forward iterator over [start, end) that includes
 // __dpx: prefix keys. Used only by StateMachine.Open() to rebuild keyEpoch.
 func (e *Engine) RawIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if e.telemetry != nil {
+		matStart = time.Now()
+	}
+
 	// Collect matching pairs under a snapshot transaction.
 	var pairs [][2][]byte
 	e.db.View(func(txn *badger.Txn) error {
@@ -234,14 +246,20 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 		}
 		return nil
 	})
+
+	if e.telemetry != nil {
+		e.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
 	return &badgerIter{pairs: pairs, idx: -1}
 }
 
 // badgerSnapshot
 
 type badgerSnapshot struct {
-	txn *badger.Txn
-	seq uint64
+	txn       *badger.Txn
+	seq       uint64
+	telemetry engine.StageRecorder
 }
 
 func (s *badgerSnapshot) Get(key []byte) ([]byte, error) {
@@ -272,6 +290,11 @@ func (s *badgerSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 }
 
 func (s *badgerSnapshot) NewIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if s.telemetry != nil {
+		matStart = time.Now()
+	}
+
 	// Materialise the range under the snapshot transaction.
 	var pairs [][2][]byte
 	opts := badger.DefaultIteratorOptions
@@ -293,6 +316,11 @@ func (s *badgerSnapshot) NewIter(start, end []byte) engine.Iterator {
 		}
 		pairs = append(pairs, [2][]byte{k, v})
 	}
+
+	if s.telemetry != nil {
+		s.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
 	return &badgerIter{pairs: pairs, idx: -1}
 }
 

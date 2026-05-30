@@ -13,7 +13,7 @@ import (
 	"github.com/agberohq/dpx/engine"
 )
 
-// ── Proposer boundary ────────────────────────────────────────────────────────
+// Proposer boundary
 
 // Proposer is the interface internal/raft satisfies.
 type Proposer interface {
@@ -37,25 +37,6 @@ type ApplyResult struct {
 // WatchNotifier is the interface watcherMap satisfies.
 type WatchNotifier interface {
 	NotifyBatch(writes []WriteEntry, metrics *Metrics)
-}
-
-// ProposerFactory is the function signature callers pass to dpx.Open.
-type ProposerFactory func(cfg Config, eng engine.StorageEngine, w WatchNotifier) (Proposer, error)
-
-// ── Wire format ──────────────────────────────────────────────────────────────
-
-// Proposal is the unit proposed to Raft per RunInTx call.
-// Serialised with msgpack. Timestamp carries the HLC wall+counter
-// as plain uint64/uint16 so shared does not need to import hlc.
-type Proposal struct {
-	ReadSet          []ReadEntry
-	Writes           []WriteEntry
-	TimestampWall    uint64
-	TimestampCounter uint16
-}
-
-func (p *Proposal) TimestampIsZero() bool {
-	return p.TimestampWall == 0 && p.TimestampCounter == 0
 }
 
 // ReadEntry records a key read during speculative execution.
@@ -87,7 +68,7 @@ const (
 	ResultConflict uint64 = 1
 )
 
-// ── Metrics ──────────────────────────────────────────────────────────────────
+// Metrics
 
 // Metrics is the single shared struct written by both dpx.Node and the FSM.
 // Pass the same *Metrics pointer to dpx.Open and it flows to the FSM via Config.
@@ -104,7 +85,7 @@ type Metrics struct {
 	KeyEpochRebuildDurationNs atomic.Int64
 }
 
-// ── Config ───────────────────────────────────────────────────────────────────
+// Config
 
 // SyncPolicy controls WAL durability. Canonical definition lives here;
 // dpx.SyncPolicy is a type alias so callers use the same constants.

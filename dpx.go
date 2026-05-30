@@ -1,5 +1,3 @@
-// Package dpx provides a strictly-serializable embedded key-value store
-// backed by Raft consensus and Pebble storage.
 package dpx
 
 import (
@@ -13,7 +11,6 @@ import (
 	"github.com/agberohq/dpx/shared"
 	"github.com/olekukonko/hlc"
 	"github.com/olekukonko/jack"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // KVStore is the public interface exposed by a DPX Node.
@@ -52,31 +49,47 @@ type Node struct {
 }
 
 // Open constructs and starts a DPX Node.
-//
-// newProposer is the Raft factory — pass dpxraft.Open:
-//
-//	import dpxraft "github.com/agberohq/dpx/raft"
-//	node, err := dpx.Open(cfg, dpxraft.Open)
 func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 	if cfg.Engine == nil {
 		return nil, fmt.Errorf("dpx: Config.Engine is required")
 	}
 	applyDefaults(&cfg)
 
+	// Timer: EngineOpen
+	var engineOpenStart time.Time
+	if cfg.Telemetry != nil {
+		engineOpenStart = time.Now()
+	}
 	if err := cfg.Engine.Open(); err != nil {
 		return nil, fmt.Errorf("dpx: engine open: %w", err)
 	}
+	if cfg.Telemetry != nil {
+		cfg.Telemetry.EngineOpen.Record(time.Since(engineOpenStart))
+	}
 
-	watchers := newWatcherMap()
+	// Wire telemetry into the engine for internal stage recording
+	if cfg.Telemetry != nil {
+		cfg.Engine.SetTelemetry(cfg.Telemetry)
+	}
 
+	watchers := newWatcherMap(cfg.Telemetry)
 	sharedCfg := cfg.toShared()
+
+	// Timer: RaftBootstrap
+	var raftStart time.Time
+	if cfg.Telemetry != nil {
+		raftStart = time.Now()
+	}
 	proposer, err := newProposer(sharedCfg, cfg.Engine, watchers)
 	if err != nil {
 		cfg.Engine.Close()
 		return nil, fmt.Errorf("dpx: proposer: %w", err)
 	}
+	if cfg.Telemetry != nil {
+		cfg.Telemetry.RaftBootstrap.Record(time.Since(raftStart))
+	}
 
-	batcher := newBatcher(cfg.Batch)
+	batcher := newBatcher(cfg.Batch, cfg.Telemetry)
 
 	n := &Node{
 		proposer:  proposer,
@@ -110,11 +123,28 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 			panic(fmt.Sprintf("dpx: register shutdown %q: %v", name, err))
 		}
 	}
-	mustRegister("raft", 0, func(_ context.Context) error { return proposer.Shutdown() })
-	mustRegister("watchers", 1, func(_ context.Context) error { watchers.closeAll(); return nil })
-	mustRegister("engine", 2, func(_ context.Context) error { return cfg.Engine.Close() })
-	n.shutdown = sd
 
+	// Timer: ShutdownRaft
+	mustRegister("raft", 0, func(_ context.Context) error {
+		if n.telemetry != nil {
+			t0 := time.Now()
+			defer func() { n.telemetry.ShutdownRaft.Record(time.Since(t0)) }()
+		}
+		return proposer.Shutdown()
+	})
+
+	mustRegister("watchers", 1, func(_ context.Context) error { watchers.closeAll(); return nil })
+
+	// Timer: ShutdownEngine
+	mustRegister("engine", 2, func(_ context.Context) error {
+		if n.telemetry != nil {
+			t0 := time.Now()
+			defer func() { n.telemetry.ShutdownEngine.Record(time.Since(t0)) }()
+		}
+		return cfg.Engine.Close()
+	})
+
+	n.shutdown = sd
 	return n, nil
 }
 
@@ -123,9 +153,26 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 	if n.closed.Load() {
 		return ErrStoreClosed
 	}
+
+	var totalExec time.Duration
+	var retryStart time.Time
+	if n.telemetry != nil {
+		retryStart = time.Now()
+	}
+
 	err := n.retry.Do(ctx, func(ctx context.Context) error {
+		t0 := time.Now()
+		defer func() { totalExec += time.Since(t0) }()
 		return n.runOnce(ctx, fn)
 	})
+
+	// Record retry backoff = wall clock time minus actual execution time
+	if n.telemetry != nil {
+		if backoff := time.Since(retryStart) - totalExec; backoff > 0 {
+			n.telemetry.RetryBackoff.Record(backoff)
+		}
+	}
+
 	if errors.Is(err, jack.ErrRetryExhausted) {
 		if n.metrics != nil {
 			n.metrics.ConflictExhausted.Add(1)
@@ -137,19 +184,31 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 
 func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	t0 := time.Now()
+
+	// Timer: SnapshotCreate (Engine-specific)
+	var snapStart time.Time
+	if n.telemetry != nil {
+		snapStart = time.Now()
+	}
 	snap, err := n.engine.GetSnapshot()
 	if err != nil {
 		return fmt.Errorf("dpx: GetSnapshot: %w", err)
 	}
 	if n.telemetry != nil {
+		n.telemetry.SnapshotCreate.Record(time.Since(snapStart))
+	}
+	// Existing timer: GetSnapshot (covers dpx overhead + engine call)
+	if n.telemetry != nil {
 		n.telemetry.GetSnapshot.Record(time.Since(t0))
 	}
+
 	defer snap.Close()
 
 	tx := &dpxTx{
-		snap:    snap,
-		readSet: make(map[string]shared.ReadEntry, 8),
-		writes:  make([]shared.WriteEntry, 0, 8),
+		snap:      snap,
+		readSet:   make(map[string]shared.ReadEntry, 8),
+		writes:    make([]shared.WriteEntry, 0, 8),
+		telemetry: n.telemetry,
 	}
 
 	t1 := time.Now()
@@ -157,7 +216,6 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	if n.telemetry != nil {
 		n.telemetry.Speculate.Record(time.Since(t1))
 	}
-
 	if fnErr != nil {
 		return fnErr
 	}
@@ -179,19 +237,22 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	t3 := time.Now()
 	var res shared.ApplyResult
 	if dp, ok := n.proposer.(shared.DirectProposer); ok {
-		// Fast path: skip msgpack — proposer accepts *Proposal directly.
 		res, err = dp.ProposeDirect(proposal)
 	} else {
-		// Slow path: serialize for network transport (Raft mode).
 		t2 := time.Now()
 		var data []byte
-		data, err = msgpack.Marshal(proposal)
-		if err != nil {
-			return fmt.Errorf("dpx: marshal: %w", err)
-		}
+		data = proposal.Marshal()
+		//if err != nil {
+		//	return fmt.Errorf("dpx: marshal: %w", err)
+		//}
 		if n.telemetry != nil {
 			n.telemetry.Marshal.Record(time.Since(t2))
 		}
+
+		if err := n.batcher.Wait(ctx, len(data)); err != nil {
+			return err
+		}
+
 		res, err = n.proposer.Propose(data)
 	}
 	if err != nil {
@@ -203,7 +264,6 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	if n.metrics != nil {
 		n.metrics.RaftCommitDurationNs.Add(time.Since(t3).Nanoseconds())
 	}
-
 	if res.Err != nil {
 		return res.Err
 	}
@@ -262,12 +322,31 @@ func (n *Node) Backup(_ context.Context, destDir string) error {
 	if n.closed.Load() {
 		return ErrStoreClosed
 	}
+
+	// Timer: EngineSync
+	var syncStart time.Time
+	if n.telemetry != nil {
+		syncStart = time.Now()
+	}
 	if err := n.engine.Sync(); err != nil {
 		return fmt.Errorf("dpx: Backup Sync: %w", err)
+	}
+	if n.telemetry != nil {
+		n.telemetry.EngineSync.Record(time.Since(syncStart))
+	}
+
+	// Timer: SnapshotCreate (Backup path)
+	var snapStart time.Time
+	if n.telemetry != nil {
+		snapStart = time.Now()
 	}
 	if err := n.engine.CreateCheckpoint(destDir); err != nil {
 		return fmt.Errorf("dpx: Backup checkpoint: %w", err)
 	}
+	if n.telemetry != nil {
+		n.telemetry.SnapshotCreate.Record(time.Since(snapStart))
+	}
+
 	if n.metrics != nil {
 		n.metrics.BackupTotal.Add(1)
 	}
@@ -279,7 +358,7 @@ func (n *Node) SetBatchConfig(cfg BatchConfig) {
 	n.batcher.SetConfig(cfg)
 }
 
-// Close gracefully shuts down the node (Raft -> watchers -> engine).
+// Close gracefully shuts down the node.
 func (n *Node) Close() error {
 	if !n.closed.CompareAndSwap(false, true) {
 		return nil

@@ -33,12 +33,12 @@ func nodeWithFake(t *testing.T, fp *fakeProposer) *Node {
 
 	cfg := Config{Engine: eng}
 	applyDefaults(&cfg)
-	watchers := newWatcherMap()
+	watchers := newWatcherMap(nil)
 
 	n := &Node{
 		proposer: fp,
 		engine:   eng,
-		batcher:  newBatcher(cfg.Batch),
+		batcher:  newBatcher(cfg.Batch, cfg.Telemetry),
 		watchers: watchers,
 		clock:    hlc.NewClock(),
 	}

@@ -3,6 +3,7 @@ package dpx
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/agberohq/dpx/shared"
@@ -10,9 +11,10 @@ import (
 
 // dpxTx is the KVTx implementation for one RunInTx attempt.
 type dpxTx struct {
-	snap    engine.Snapshot
-	readSet map[string]shared.ReadEntry
-	writes  []shared.WriteEntry
+	snap      engine.Snapshot
+	readSet   map[string]shared.ReadEntry
+	writes    []shared.WriteEntry
+	telemetry *shared.Telemetry // <-- ADDED
 }
 
 // Get reads a key from the snapshot and records it in the read-set.
@@ -62,7 +64,6 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 	if isReserved(key) {
 		return 0, ErrReservedKey
 	}
-
 	if delta > 0 {
 		val, err := tx.snap.Get(key)
 		if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
@@ -77,7 +78,6 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 		})
 		return decodeInt64(val), nil
 	}
-
 	val, err := tx.snap.Get(key)
 	if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
 		return 0, err
@@ -88,7 +88,6 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 	}
 	k := string(key)
 	tx.readSet[k] = shared.ReadEntry{Key: []byte(k), Epoch: ver.Epoch, IsDebit: true}
-
 	if delta < 0 {
 		cpKey := make([]byte, len(key))
 		copy(cpKey, key)
@@ -105,7 +104,6 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 func (tx *dpxTx) GetRange(ctx context.Context, start, end []byte, limit int) ([]engine.KVPair, error) {
 	iter := tx.snap.NewIter(start, end)
 	defer iter.Close()
-
 	var pairs []engine.KVPair
 	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
 		if limit > 0 && len(pairs) >= limit {
@@ -127,6 +125,11 @@ func (tx *dpxTx) AllocateNextSequence(_ context.Context) (uint64, error) {
 func (tx *dpxTx) empty() bool { return len(tx.writes) == 0 }
 
 func (tx *dpxTx) readSetSlice() []shared.ReadEntry {
+	if tx.telemetry != nil {
+		defer func(start time.Time) {
+			tx.telemetry.TxReadSetCopy.Record(time.Since(start))
+		}(time.Now())
+	}
 	if len(tx.readSet) == 0 {
 		return nil
 	}
@@ -139,6 +142,11 @@ func (tx *dpxTx) readSetSlice() []shared.ReadEntry {
 
 // validate checks for incompatible operations in the same transaction.
 func (tx *dpxTx) validate() error {
+	if tx.telemetry != nil {
+		defer func(start time.Time) {
+			tx.telemetry.TxValidate.Record(time.Since(start))
+		}(time.Now())
+	}
 	if len(tx.writes) == 0 {
 		return nil
 	}

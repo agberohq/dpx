@@ -3,6 +3,8 @@
 // at construction time; the rest of DPX is engine-agnostic.
 package engine
 
+import "time"
+
 // KVPair is a key-value result from a range scan.
 type KVPair struct {
 	Key   []byte
@@ -20,6 +22,13 @@ type EpochRecord struct {
 // WriteOptions controls durability for a single ApplyBatch call.
 type WriteOptions struct {
 	Sync bool // if true, fsync before returning
+}
+
+// StageRecorder is a minimal interface for recording stage durations
+// inside engine implementations without importing shared.Telemetry.
+type StageRecorder interface {
+	RecordClone(d time.Duration)
+	RecordIterMaterialise(d time.Duration)
 }
 
 // StorageEngine is the minimal surface DPX needs from any KV backend.
@@ -72,6 +81,10 @@ type StorageEngine interface {
 	// Used only by StateMachine.Open() to rebuild the keyEpoch map.
 	// Consumer-facing iterators (via Snapshot.NewIter) exclude __dpx: keys.
 	RawIter(start, end []byte) Iterator
+
+	// SetTelemetry optionally provides a StageRecorder for internal timing.
+	// Engines that don't need telemetry can leave this as a no-op.
+	SetTelemetry(r StageRecorder)
 }
 
 // Snapshot provides a consistent point-in-time view of the engine.

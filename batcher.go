@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/agberohq/dpx/shared"
 )
 
 // Batcher implements the adaptive flush delay that allows Dragonboat to
@@ -18,19 +20,20 @@ import (
 // The batcher does NOT concatenate proposals into a single Raft entry.
 // Each RunInTx remains one Raft log entry.
 type Batcher struct {
-	cfg atomic.Pointer[BatchConfig]
-
-	mu     sync.Mutex
-	ema    float64   // rolling inter-arrival time (seconds)
-	lastAt time.Time // time of last Wait call
-
-	inFlight atomic.Int64 // number of goroutines currently inside Wait
-	inBytes  atomic.Int64 // total proposal bytes of in-flight goroutines
+	cfg       atomic.Pointer[BatchConfig]
+	mu        sync.Mutex
+	ema       float64           // rolling inter-arrival time (seconds)
+	lastAt    time.Time         // time of last Wait call
+	inFlight  atomic.Int64      // number of goroutines currently inside Wait
+	inBytes   atomic.Int64      // total proposal bytes of in-flight goroutines
+	telemetry *shared.Telemetry // <-- ADDED
 }
 
 // newBatcher creates a Batcher with the given config.
-func newBatcher(cfg BatchConfig) *Batcher {
-	b := &Batcher{}
+func newBatcher(cfg BatchConfig, telemetry *shared.Telemetry) *Batcher { // <-- UPDATED SIGNATURE
+	b := &Batcher{
+		telemetry: telemetry, // <-- STORED
+	}
 	b.cfg.Store(&cfg)
 	return b
 }
@@ -50,7 +53,6 @@ func (b *Batcher) SetConfig(cfg BatchConfig) {
 // Returns ctx.Err() if the context is cancelled before the delay expires.
 func (b *Batcher) Wait(ctx context.Context, proposalBytes int) error {
 	cfg := b.cfg.Load()
-
 	b.inFlight.Add(1)
 	b.inBytes.Add(int64(proposalBytes))
 	defer func() {
@@ -80,6 +82,16 @@ func (b *Batcher) Wait(ctx context.Context, proposalBytes int) error {
 	)
 	b.mu.Unlock()
 
+	// TELEMETRY HOOKS
+	var waitStart time.Time
+	if b.telemetry != nil {
+		waitStart = time.Now()
+		// Record batch size distribution at flush-decision time.
+		// We store inFlight count as "duration" nanoseconds so it fits the
+		// existing histogram-like StageTimer API without structural changes.
+		b.telemetry.BatcherFlushSize.Record(time.Duration(b.inFlight.Load()))
+	}
+
 	// Per-call timer: safe for concurrent callers.
 	// time.NewTimer + defer Stop avoids goroutine leak.
 	// The allocation (~100ns) is acceptable for v0.1.
@@ -88,8 +100,14 @@ func (b *Batcher) Wait(ctx context.Context, proposalBytes int) error {
 
 	select {
 	case <-ctx.Done():
+		if b.telemetry != nil {
+			b.telemetry.BatcherWait.Record(time.Since(waitStart))
+		}
 		return ctx.Err()
 	case <-t.C:
+		if b.telemetry != nil {
+			b.telemetry.BatcherWait.Record(time.Since(waitStart))
+		}
 		return nil
 	}
 }
