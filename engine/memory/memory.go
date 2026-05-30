@@ -1,92 +1,93 @@
-// Package memory provides an in-memory StorageEngine for DPX.
-// Not for production use — use pebble or badger for persistence.
-//
-// Design: 256-shard copy-on-write via atomic pointers.
-//
-//   - GetSnapshot: 256 atomic loads — O(1), no lock, no clone.
-//   - ApplyBatch: touches only the shards that contain modified keys.
-//     Each touched shard does a shallow clone of its own data (~N/256 entries).
-//     For a 2-key write on 10,000 keys: clone ~78 entries, not 10,000.
-//   - Snapshot isolation: each shard's old *shardState is held by any snapshot
-//     taken before ApplyBatch — writes on the new *shardState are invisible.
 package memory
 
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-const (
-	numShards = 256
-	shardMask = numShards - 1
-)
+const numShards = 32
+const shardMask = numShards - 1
 
-// shardIndex hashes a key to a shard index using FNV-1a inline
-// (avoids importing hash/fnv to keep the hot path allocation-free).
-func shardIndex(key string) int {
-	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
-		h *= 16777619
-	}
-	return int(h) & shardMask
+func shardFor(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32()) & shardMask
 }
 
-// shardState is the immutable per-shard snapshot.
-// Once stored via atomic.Pointer it is never mutated — writers clone then swap.
-type shardState struct {
-	data map[string][]byte
-	keys []string // sorted keys belonging to this shard
+// state is the immutable snapshot of engine data at a point in time.
+type state struct {
+	data    map[string][]byte
+	keys    []string
+	applied uint64
 }
 
-func newShardState() *shardState {
-	return &shardState{
-		data: make(map[string][]byte),
-		keys: []string{},
-	}
-}
-
-// clone makes a shallow copy: values are shared references ([]byte is immutable
-// once written), only the map structure and keys slice are copied.
-func (s *shardState) clone() *shardState {
-	data := make(map[string][]byte, len(s.data)+4)
+func (s *state) clone() *state {
+	data := make(map[string][]byte, len(s.data))
 	for k, v := range s.data {
-		data[k] = v // share value reference; safe — values are never mutated in place
+		data[k] = v
 	}
 	keys := make([]string, len(s.keys))
 	copy(keys, s.keys)
-	return &shardState{data: data, keys: keys}
+	return &state{data: data, keys: keys, applied: s.applied}
 }
 
-type shard struct {
+// shardState wraps a state with its own mutex for independent locking.
+type shardState struct {
 	mu  sync.Mutex
-	cur atomic.Pointer[shardState]
+	cur atomic.Pointer[state]
 }
 
-// Engine is the sharded in-memory StorageEngine.
+// Engine is the in-memory StorageEngine.
+// When sharded=true, keys are partitioned across 32 shards for parallel writes.
+// When sharded=false, all keys live in shard 0 (backward compatible).
 type Engine struct {
-	shards  [numShards]shard
-	applied atomic.Uint64 // tracks __dpx:applied sequence
-	dir     string
+	sharded   bool
+	shards    [numShards]shardState
+	cur       atomic.Pointer[state] // legacy non-sharded path
+	mu        sync.Mutex            // legacy non-sharded path
+	dir       string
+	telemetry engine.StageRecorder
 }
 
-// New creates an in-memory engine with 256 shards.
+// New creates a non-sharded in-memory engine.
 func New() *Engine {
-	e := &Engine{}
-	for i := range e.shards {
-		e.shards[i].cur.Store(newShardState())
-	}
+	e := &Engine{sharded: false}
+	e.cur.Store(&state{
+		data: make(map[string][]byte),
+		keys: []string{},
+	})
 	dir, _ := os.MkdirTemp("", "dpx-memory-*")
 	e.dir = dir
 	return e
+}
+
+// NewSharded creates a sharded in-memory engine.
+// Each shard has its own mutex and state, enabling parallel writes.
+func NewSharded() *Engine {
+	e := &Engine{sharded: true}
+	for i := range e.shards {
+		e.shards[i].cur.Store(&state{
+			data: make(map[string][]byte),
+			keys: []string{},
+		})
+	}
+	dir, _ := os.MkdirTemp("", "dpx-sharded-*")
+	e.dir = dir
+	return e
+}
+
+func (e *Engine) SetTelemetry(r engine.StageRecorder) {
+	e.telemetry = r
 }
 
 func (e *Engine) Open() error {
@@ -109,21 +110,23 @@ func (e *Engine) Open() error {
 	if d.Data == nil {
 		d.Data = make(map[string][]byte)
 	}
-	// Distribute loaded keys across shards.
-	states := make([]*shardState, numShards)
-	for i := range states {
-		states[i] = newShardState()
+	if e.sharded {
+		for k, v := range d.Data {
+			s := shardFor(k)
+			st := e.shards[s].cur.Load()
+			next := st.clone()
+			next.data[k] = v
+			insertKey(&next.keys, k)
+			e.shards[s].cur.Store(next)
+		}
+	} else {
+		keys := make([]string, 0, len(d.Data))
+		for k := range d.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		e.cur.Store(&state{data: d.Data, keys: keys, applied: d.Applied})
 	}
-	for k, v := range d.Data {
-		si := shardIndex(k)
-		states[si].data[k] = v
-		states[si].keys = append(states[si].keys, k)
-	}
-	for i, s := range states {
-		sort.Strings(s.keys)
-		e.shards[i].cur.Store(s)
-	}
-	e.applied.Store(d.Applied)
 	return nil
 }
 
@@ -131,9 +134,19 @@ func (e *Engine) Close() error { return nil }
 func (e *Engine) Sync() error  { return nil }
 
 func (e *Engine) Get(key []byte) ([]byte, error) {
-	k := string(key)
-	s := e.shards[shardIndex(k)].cur.Load()
-	v := s.data[k]
+	if e.sharded {
+		s := &e.shards[shardFor(string(key))]
+		st := s.cur.Load()
+		v, ok := st.data[string(key)]
+		if !ok {
+			return nil, engine.ErrKeyNotFound
+		}
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		return cp, nil
+	}
+	s := e.cur.Load()
+	v := s.data[string(key)]
 	if v == nil {
 		return nil, engine.ErrKeyNotFound
 	}
@@ -142,115 +155,225 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
-// GetSnapshot is O(256) atomic loads — effectively O(1), no lock, no clone.
 func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
-	snap := &memSnapshot{
-		states:  make([]*shardState, numShards),
-		applied: e.applied.Load(),
+	if e.sharded {
+		snap := &shardedSnapshot{
+			states:    make([]*state, numShards),
+			telemetry: e.telemetry,
+		}
+		for i := range e.shards {
+			snap.states[i] = e.shards[i].cur.Load()
+		}
+		return snap, nil
 	}
-	for i := range e.shards {
-		snap.states[i] = e.shards[i].cur.Load()
-	}
-	return snap, nil
+	return &memSnapshot{s: e.cur.Load(), telemetry: e.telemetry}, nil
 }
 
 func (e *Engine) NewBatch() engine.Batch {
+	if e.sharded {
+		return &shardedBatch{byShard: make(map[int]*memBatch)}
+	}
 	return &memBatch{}
 }
 
-// ApplyBatch groups ops by shard, clones only touched shards, and atomically
-// swaps each shard's state pointer. Untouched shards are not cloned.
 func (e *Engine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
+	if e.sharded {
+		return e.applyBatchSharded(b)
+	}
+	return e.applyBatchLegacy(b)
+}
+
+func (e *Engine) applyBatchLegacy(b engine.Batch) error {
 	mb := b.(*memBatch)
-	if len(mb.ops) == 0 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.cur.Load()
+
+	var cloneStart time.Time
+	if e.telemetry != nil {
+		cloneStart = time.Now()
+	}
+	next := cur.clone()
+	if e.telemetry != nil {
+		e.telemetry.RecordClone(time.Since(cloneStart))
+	}
+
+	keysDirty := false
+	for _, op := range mb.ops {
+		switch op.op {
+		case 's':
+			if _, exists := next.data[op.key]; !exists {
+				next.keys = append(next.keys, op.key)
+				keysDirty = true
+			}
+			next.data[op.key] = op.value
+			if op.key == "__dpx:applied" && len(op.value) >= 8 {
+				next.applied = binary.LittleEndian.Uint64(op.value)
+			}
+		case 'd':
+			if _, exists := next.data[op.key]; exists {
+				delete(next.data, op.key)
+				keysDirty = true
+			}
+		case 'm':
+			if _, exists := next.data[op.key]; !exists {
+				next.keys = append(next.keys, op.key)
+				keysDirty = true
+			}
+			next.data[op.key] = encodeInt64(decodeInt64(next.data[op.key]) + decodeInt64(op.value))
+		}
+	}
+
+	// O(N log N) sort once per batch instead of O(N^2) shuffling!
+	if keysDirty {
+		sort.Strings(next.keys)
+		writeIdx := 0
+		for i := 0; i < len(next.keys); i++ {
+			k := next.keys[i]
+			if i > 0 && next.keys[i-1] == k {
+				continue // skip duplicates
+			}
+			if _, exists := next.data[k]; exists {
+				next.keys[writeIdx] = k
+				writeIdx++
+			}
+		}
+		next.keys = next.keys[:writeIdx]
+	}
+
+	e.cur.Store(next)
+	return nil
+}
+
+func (e *Engine) applyBatchSharded(b engine.Batch) error {
+	sb := b.(*shardedBatch)
+	if len(sb.byShard) == 0 {
 		return nil
 	}
-
-	// Group ops by shard — single pass, no allocations for common case (1–4 keys).
-	type shardOps struct {
-		si  int
-		ops []batchOp
+	shardIds := make([]int, 0, len(sb.byShard))
+	for s := range sb.byShard {
+		shardIds = append(shardIds, s)
 	}
-	// Use a small stack-allocated map via slice for typical small batches.
-	byShard := make(map[int][]batchOp, 4)
-	for _, op := range mb.ops {
-		si := shardIndex(op.key)
-		byShard[si] = append(byShard[si], op)
-	}
+	sort.Ints(shardIds)
 
-	// Lock shards in ascending index order to prevent deadlock.
-	shardIDs := make([]int, 0, len(byShard))
-	for si := range byShard {
-		shardIDs = append(shardIDs, si)
-	}
-	sort.Ints(shardIDs)
-
-	for _, si := range shardIDs {
-		sh := &e.shards[si]
-		ops := byShard[si]
-
+	for _, s := range shardIds {
+		sh := &e.shards[s]
+		batch := sb.byShard[s]
 		sh.mu.Lock()
 		cur := sh.cur.Load()
-		next := cur.clone() // clone only this shard's ~N/256 entries
 
-		for _, op := range ops {
+		var cloneStart time.Time
+		if e.telemetry != nil {
+			cloneStart = time.Now()
+		}
+		next := cur.clone()
+		if e.telemetry != nil {
+			e.telemetry.RecordClone(time.Since(cloneStart))
+		}
+
+		keysDirty := false
+		for _, op := range batch.ops {
 			switch op.op {
 			case 's':
+				if _, exists := next.data[op.key]; !exists {
+					next.keys = append(next.keys, op.key)
+					keysDirty = true
+				}
 				next.data[op.key] = op.value
-				insertKey(&next.keys, op.key)
 			case 'd':
-				delete(next.data, op.key)
-				deleteKey(&next.keys, op.key)
+				if _, exists := next.data[op.key]; exists {
+					delete(next.data, op.key)
+					keysDirty = true
+				}
 			case 'm':
+				if _, exists := next.data[op.key]; !exists {
+					next.keys = append(next.keys, op.key)
+					keysDirty = true
+				}
 				next.data[op.key] = encodeInt64(decodeInt64(next.data[op.key]) + decodeInt64(op.value))
-				insertKey(&next.keys, op.key)
 			}
+		}
+
+		if keysDirty {
+			sort.Strings(next.keys)
+			writeIdx := 0
+			for i := 0; i < len(next.keys); i++ {
+				k := next.keys[i]
+				if i > 0 && next.keys[i-1] == k {
+					continue
+				}
+				if _, exists := next.data[k]; exists {
+					next.keys[writeIdx] = k
+					writeIdx++
+				}
+			}
+			next.keys = next.keys[:writeIdx]
 		}
 
 		sh.cur.Store(next)
 		sh.mu.Unlock()
 	}
-
-	// Update applied sequence if the batch contains __dpx:applied.
-	for _, op := range mb.ops {
-		if op.key == "__dpx:applied" && len(op.value) >= 8 {
-			e.applied.Store(binary.LittleEndian.Uint64(op.value))
-			break
-		}
-	}
 	return nil
 }
 
-func (e *Engine) CurrentSequence() uint64 { return e.applied.Load() }
-func (e *Engine) DataDir() string         { return e.dir }
-
-// currentKeys returns a sorted merge of all shard keys for test inspection.
-func (e *Engine) currentKeys() []string {
-	var all []string
-	for i := range e.shards {
-		s := e.shards[i].cur.Load()
-		all = append(all, s.keys...)
+func (e *Engine) CurrentSequence() uint64 {
+	if e.sharded {
+		var maxSeq uint64
+		for i := range e.shards {
+			st := e.shards[i].cur.Load()
+			if st.applied > maxSeq {
+				maxSeq = st.applied
+			}
+		}
+		return maxSeq
 	}
-	sort.Strings(all)
-	return all
+	return e.cur.Load().applied
+}
+
+func (e *Engine) DataDir() string { return e.dir }
+
+func (e *Engine) currentKeys() []string {
+	if e.sharded {
+		var all []string
+		for i := range e.shards {
+			st := e.shards[i].cur.Load()
+			all = append(all, st.keys...)
+		}
+		sort.Strings(all)
+		return all
+	}
+	s := e.cur.Load()
+	keys := make([]string, len(s.keys))
+	copy(keys, s.keys)
+	return keys
 }
 
 func (e *Engine) CreateCheckpoint(dir string) error {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	all := make(map[string][]byte)
-	for i := range e.shards {
-		s := e.shards[i].cur.Load()
-		for k, v := range s.data {
-			all[k] = v
+	allData := make(map[string][]byte)
+	var applied uint64
+	if e.sharded {
+		for i := range e.shards {
+			st := e.shards[i].cur.Load()
+			for k, v := range st.data {
+				allData[k] = v
+			}
+			if st.applied > applied {
+				applied = st.applied
+			}
 		}
+	} else {
+		s := e.cur.Load()
+		allData = s.data
+		applied = s.applied
 	}
 	type dump struct {
 		Data    map[string][]byte
 		Applied uint64
 	}
-	b, err := msgpack.Marshal(dump{Data: all, Applied: e.applied.Load()})
+	b, err := msgpack.Marshal(dump{Data: allData, Applied: applied})
 	if err != nil {
 		return err
 	}
@@ -258,36 +381,324 @@ func (e *Engine) CreateCheckpoint(dir string) error {
 }
 
 func (e *Engine) RawIter(start, end []byte) engine.Iterator {
-	// Collect all matching keys from all shards, sorted.
-	ss, se := string(start), string(end)
-	var all []string
-	for i := range e.shards {
-		s := e.shards[i].cur.Load()
-		for _, k := range s.keys {
-			if k < ss {
-				continue
-			}
-			if se != "" && k >= se {
-				break
-			}
-			all = append(all, k)
-		}
+	if e.sharded {
+		return e.rawIterSharded(start, end)
 	}
-	sort.Strings(all)
-	// Build a unified data view.
-	data := make(map[string][]byte, len(all))
-	for i := range e.shards {
-		s := e.shards[i].cur.Load()
-		for _, k := range all {
-			if v, ok := s.data[k]; ok {
-				data[k] = v
-			}
-		}
-	}
-	return &memIter{keys: all, data: data, pos: -1}
+	return e.rawIterLegacy(start, end)
 }
 
-// ── Key index helpers ─────────────────────────────────────────────────────────
+func (e *Engine) rawIterLegacy(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if e.telemetry != nil {
+		matStart = time.Now()
+	}
+
+	s := e.cur.Load()
+	ss, se := string(start), string(end)
+	startIdx := sort.SearchStrings(s.keys, ss)
+	var filtered []string
+	for i := startIdx; i < len(s.keys); i++ {
+		k := s.keys[i]
+		if se != "" && k >= se {
+			break
+		}
+		filtered = append(filtered, k)
+	}
+
+	if e.telemetry != nil {
+		e.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
+	return &memIter{keys: filtered, data: s.data, pos: -1}
+}
+
+func (e *Engine) rawIterSharded(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if e.telemetry != nil {
+		matStart = time.Now()
+	}
+
+	var pairs [][2][]byte
+	ss, se := string(start), string(end)
+	for i := range e.shards {
+		st := e.shards[i].cur.Load()
+		for _, k := range st.keys {
+			if k >= ss && (se == "" || k < se) {
+				v := st.data[k]
+				cp := make([]byte, len(v))
+				copy(cp, v)
+				pairs = append(pairs, [2][]byte{[]byte(k), cp})
+			}
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return string(pairs[i][0]) < string(pairs[j][0]) })
+
+	if e.telemetry != nil {
+		e.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
+	return &memIter{pairs: pairs, pos: -1}
+}
+
+// Sharded Batch
+
+type shardedBatch struct {
+	byShard map[int]*memBatch
+}
+
+func (b *shardedBatch) Set(key, value []byte) {
+	s := shardFor(string(key))
+	if b.byShard[s] == nil {
+		b.byShard[s] = &memBatch{}
+	}
+	b.byShard[s].Set(key, value)
+}
+
+func (b *shardedBatch) Delete(key []byte) {
+	s := shardFor(string(key))
+	if b.byShard[s] == nil {
+		b.byShard[s] = &memBatch{}
+	}
+	b.byShard[s].Delete(key)
+}
+
+func (b *shardedBatch) Merge(key, value []byte) {
+	s := shardFor(string(key))
+	if b.byShard[s] == nil {
+		b.byShard[s] = &memBatch{}
+	}
+	b.byShard[s].Merge(key, value)
+}
+
+func (b *shardedBatch) Reset() {
+	b.byShard = make(map[int]*memBatch)
+}
+
+// Legacy Batch
+
+type batchOp struct {
+	op    byte
+	key   string
+	value []byte
+}
+
+type memBatch struct {
+	ops []batchOp
+}
+
+func (b *memBatch) Set(key, value []byte) {
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	b.ops = append(b.ops, batchOp{op: 's', key: string(key), value: cp})
+}
+
+func (b *memBatch) Delete(key []byte) {
+	b.ops = append(b.ops, batchOp{op: 'd', key: string(key)})
+}
+
+func (b *memBatch) Merge(key, value []byte) {
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	b.ops = append(b.ops, batchOp{op: 'm', key: string(key), value: cp})
+}
+
+func (b *memBatch) Reset() { b.ops = b.ops[:0] }
+
+// Legacy Snapshot
+
+type memSnapshot struct {
+	s         *state
+	telemetry engine.StageRecorder
+}
+
+func (s *memSnapshot) Get(key []byte) ([]byte, error) {
+	v := s.s.data[string(key)]
+	if v == nil {
+		return nil, engine.ErrKeyNotFound
+	}
+	cp := make([]byte, len(v))
+	copy(cp, v)
+	return cp, nil
+}
+
+func (s *memSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
+	vk := "__dpx:ver:" + string(key)
+	b := s.s.data[vk]
+	if len(b) < 9 {
+		return engine.EpochRecord{}, nil
+	}
+	return engine.EpochRecord{
+		Epoch:    binary.LittleEndian.Uint64(b[:8]),
+		IsCredit: b[8] == 1,
+	}, nil
+}
+
+func (s *memSnapshot) NewIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if s.telemetry != nil {
+		matStart = time.Now()
+	}
+
+	ss, se := string(start), string(end)
+	prefix := "__dpx:"
+	startIdx := sort.SearchStrings(s.s.keys, ss)
+	var filtered []string
+	for i := startIdx; i < len(s.s.keys); i++ {
+		k := s.s.keys[i]
+		if se != "" && k >= se {
+			break
+		}
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			continue
+		}
+		filtered = append(filtered, k)
+	}
+
+	if s.telemetry != nil {
+		s.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
+	return &memIter{keys: filtered, data: s.s.data, pos: -1}
+}
+
+func (s *memSnapshot) Sequence() uint64 { return s.s.applied }
+func (s *memSnapshot) Close() error     { return nil }
+
+// Sharded Snapshot
+
+type shardedSnapshot struct {
+	states    []*state
+	telemetry engine.StageRecorder
+}
+
+func (s *shardedSnapshot) Get(key []byte) ([]byte, error) {
+	sh := shardFor(string(key))
+	st := s.states[sh]
+	v, ok := st.data[string(key)]
+	if !ok {
+		return nil, engine.ErrKeyNotFound
+	}
+	cp := make([]byte, len(v))
+	copy(cp, v)
+	return cp, nil
+}
+
+func (s *shardedSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
+	vk := "__dpx:ver:" + string(key)
+	sh := shardFor(vk)
+	st := s.states[sh]
+	b := st.data[vk]
+	if len(b) < 9 {
+		return engine.EpochRecord{}, nil
+	}
+	return engine.EpochRecord{
+		Epoch:    binary.LittleEndian.Uint64(b[:8]),
+		IsCredit: b[8] == 1,
+	}, nil
+}
+
+func (s *shardedSnapshot) NewIter(start, end []byte) engine.Iterator {
+	var matStart time.Time
+	if s.telemetry != nil {
+		matStart = time.Now()
+	}
+
+	var all [][2][]byte
+	ss, se := string(start), string(end)
+	prefix := "__dpx:"
+	for i := range s.states {
+		for _, k := range s.states[i].keys {
+			if k >= ss && (se == "" || k < se) {
+				if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+					continue
+				}
+				v := s.states[i].data[k]
+				cp := make([]byte, len(v))
+				copy(cp, v)
+				all = append(all, [2][]byte{[]byte(k), cp})
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return string(all[i][0]) < string(all[j][0]) })
+
+	if s.telemetry != nil {
+		s.telemetry.RecordIterMaterialise(time.Since(matStart))
+	}
+
+	return &memIter{pairs: all, pos: -1}
+}
+
+func (s *shardedSnapshot) Sequence() uint64 { return 0 } // aggregated across shards
+func (s *shardedSnapshot) Close() error     { return nil }
+
+// Iterator
+
+type memIter struct {
+	keys  []string
+	data  map[string][]byte
+	pairs [][2][]byte
+	pos   int
+}
+
+func (it *memIter) First() bool {
+	it.pos = 0
+	if it.pairs != nil {
+		return it.pos < len(it.pairs)
+	}
+	return it.pos < len(it.keys)
+}
+
+func (it *memIter) Next() bool {
+	it.pos++
+	if it.pairs != nil {
+		return it.pos < len(it.pairs)
+	}
+	return it.pos < len(it.keys)
+}
+
+func (it *memIter) Prev() bool {
+	if it.pos <= 0 {
+		it.pos = -1
+		return false
+	}
+	it.pos--
+	return true
+}
+
+func (it *memIter) Valid() bool {
+	if it.pos < 0 {
+		return false
+	}
+	if it.pairs != nil {
+		return it.pos < len(it.pairs)
+	}
+	return it.pos < len(it.keys)
+}
+
+func (it *memIter) Key() []byte {
+	if !it.Valid() {
+		return nil
+	}
+	if it.pairs != nil {
+		return it.pairs[it.pos][0]
+	}
+	return []byte(it.keys[it.pos])
+}
+
+func (it *memIter) Value() []byte {
+	if !it.Valid() {
+		return nil
+	}
+	if it.pairs != nil {
+		return it.pairs[it.pos][1]
+	}
+	return it.data[it.keys[it.pos]]
+}
+
+func (it *memIter) Error() error { return nil }
+func (it *memIter) Close() error { return nil }
+
+// Helpers
 
 func insertKey(keys *[]string, k string) {
 	i := sort.SearchStrings(*keys, k)
@@ -306,8 +717,6 @@ func deleteKey(keys *[]string, k string) {
 	}
 	*keys = append((*keys)[:i], (*keys)[i+1:]...)
 }
-
-// ── Int64 encode/decode ───────────────────────────────────────────────────────
 
 func encodeInt64(v int64) []byte {
 	b := make([]byte, 8)
@@ -341,141 +750,6 @@ func isReserved(key string) bool {
 	return len(key) >= len(prefix) && key[:len(prefix)] == prefix
 }
 
-// ── Batch ─────────────────────────────────────────────────────────────────────
-
-type batchOp struct {
-	op    byte
-	key   string
-	value []byte
-}
-
-type memBatch struct {
-	ops []batchOp
-}
-
-func (b *memBatch) Set(key, value []byte) {
-	cp := make([]byte, len(value))
-	copy(cp, value)
-	b.ops = append(b.ops, batchOp{op: 's', key: string(key), value: cp})
-}
-
-func (b *memBatch) Delete(key []byte) {
-	b.ops = append(b.ops, batchOp{op: 'd', key: string(key)})
-}
-
-func (b *memBatch) Merge(key, value []byte) {
-	cp := make([]byte, len(value))
-	copy(cp, value)
-	b.ops = append(b.ops, batchOp{op: 'm', key: string(key), value: cp})
-}
-
-func (b *memBatch) Reset() { b.ops = b.ops[:0] }
-
-// ── Snapshot ──────────────────────────────────────────────────────────────────
-
-// memSnapshot holds one *shardState per shard, captured atomically at snapshot time.
-type memSnapshot struct {
-	states  []*shardState
-	applied uint64
-}
-
-func (s *memSnapshot) get(key string) []byte {
-	return s.states[shardIndex(key)].data[key]
-}
-
-func (s *memSnapshot) Get(key []byte) ([]byte, error) {
-	v := s.get(string(key))
-	if v == nil {
-		return nil, engine.ErrKeyNotFound
-	}
-	cp := make([]byte, len(v))
-	copy(cp, v)
-	return cp, nil
-}
-
-func (s *memSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
-	vk := "__dpx:ver:" + string(key)
-	b := s.get(vk)
-	return decodeEpochRecord(b), nil
-}
-
-func (s *memSnapshot) Sequence() uint64 { return s.applied }
-func (s *memSnapshot) Close() error     { return nil }
-
-func (s *memSnapshot) NewIter(start, end []byte) engine.Iterator {
-	ss, se := string(start), string(end)
-	const prefix = "__dpx:"
-
-	// Collect matching user keys from all shards, then sort.
-	var all []string
-	for _, sh := range s.states {
-		for _, k := range sh.keys {
-			if k < ss {
-				continue
-			}
-			if se != "" && k >= se {
-				break
-			}
-			if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
-				continue // hide internal keys
-			}
-			all = append(all, k)
-		}
-	}
-	sort.Strings(all)
-
-	// Build a single data view for the iterator.
-	data := make(map[string][]byte, len(all))
-	for _, k := range all {
-		if v := s.get(k); v != nil {
-			data[k] = v
-		}
-	}
-	return &memIter{keys: all, data: data, pos: -1}
-}
-
-// ── Iterator ──────────────────────────────────────────────────────────────────
-
-type memIter struct {
-	keys []string
-	data map[string][]byte
-	pos  int
-}
-
-func (it *memIter) First() bool {
-	it.pos = 0
-	return it.pos < len(it.keys)
-}
-
-func (it *memIter) Next() bool {
-	it.pos++
-	return it.pos < len(it.keys)
-}
-
-func (it *memIter) Prev() bool {
-	if it.pos <= 0 {
-		it.pos = -1 // sentinel: past-beginning
-		return false
-	}
-	it.pos--
-	return true
-}
-
-func (it *memIter) Valid() bool { return it.pos >= 0 && it.pos < len(it.keys) }
-
-func (it *memIter) Key() []byte {
-	if !it.Valid() {
-		return nil
-	}
-	return []byte(it.keys[it.pos])
-}
-
-func (it *memIter) Value() []byte {
-	if !it.Valid() {
-		return nil
-	}
-	return it.data[it.keys[it.pos]]
-}
-
-func (it *memIter) Error() error { return nil }
-func (it *memIter) Close() error { return nil }
+// IsSharded reports whether this engine uses sharded storage.
+// Satisfies the shardedMarker interface used by raft/node.go.
+func (e *Engine) IsSharded() bool { return e.sharded }
