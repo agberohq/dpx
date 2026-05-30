@@ -41,6 +41,18 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		rCfg.LogOutput = io.Discard
 	}
 
+	// Tuning for embedded single-process use.
+	// BatchApplyCh: raft collects all pending Apply() calls and delivers them
+	// to ApplyBatch() in one shot — our FSM handles this natively.
+	// CommitTimeout: how long the leader waits before flushing a partial batch.
+	// 1ms instead of 50ms default = 50x less idle latency under low concurrency.
+	rCfg.BatchApplyCh = true
+	rCfg.CommitTimeout = 1 * time.Millisecond
+	rCfg.HeartbeatTimeout = 50 * time.Millisecond
+	rCfg.ElectionTimeout = 50 * time.Millisecond
+	rCfg.LeaderLeaseTimeout = 40 * time.Millisecond // must be <= HeartbeatTimeout
+	rCfg.MaxAppendEntries = 256
+
 	// FSM owns its own HLC clock — no shared.Clock interface needed.
 	clock := hlc.NewClock()
 	f := newFSM(eng, cfg.SyncPolicy, w, cfg.Metrics, clock)
@@ -57,7 +69,11 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		return nil, fmt.Errorf("raft: snapshot store: %w", err)
 	}
 
-	embedded := len(cfg.Peers) == 0
+	// Embedded single-node: bypass Raft entirely.
+	// directProposer gives the same OCC semantics with zero channel overhead.
+	if len(cfg.Peers) == 0 {
+		return newDirectProposer(eng, cfg.SyncPolicy, w, cfg.Metrics, cfg.Telemetry)
+	}
 
 	var (
 		transport    hraft.Transport
@@ -67,12 +83,7 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		stableCloser io.Closer
 	)
 
-	if embedded {
-		// ── Embedded single-node: fully in-memory, no network, no BoltDB ──
-		_, transport = hraft.NewInmemTransport("")
-		logStore = hraft.NewInmemStore()
-		stableStore = hraft.NewInmemStore()
-	} else {
+	{
 		// ── Multi-node: TCP transport + BoltDB persistent stores ──
 		listenAddr := cfg.ListenAddr
 		if listenAddr == "" {
@@ -134,20 +145,13 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		return nil, fmt.Errorf("raft: new raft: %w", err)
 	}
 
-	// Bootstrap.
+	// Bootstrap — multi-node only (embedded returns early above).
 	var servers []hraft.Server
-	if embedded {
-		servers = []hraft.Server{{
-			ID:      rCfg.LocalID,
-			Address: transport.LocalAddr(),
-		}}
-	} else {
-		for id, addr := range cfg.Peers {
-			servers = append(servers, hraft.Server{
-				ID:      hraft.ServerID(id),
-				Address: hraft.ServerAddress(addr),
-			})
-		}
+	for id, addr := range cfg.Peers {
+		servers = append(servers, hraft.Server{
+			ID:      hraft.ServerID(id),
+			Address: hraft.ServerAddress(addr),
+		})
 	}
 	r.BootstrapCluster(hraft.Configuration{Servers: servers})
 

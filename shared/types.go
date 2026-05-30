@@ -21,6 +21,13 @@ type Proposer interface {
 	Shutdown() error
 }
 
+// DirectProposer extends Proposer for single-node embedded mode.
+// Callers that detect this interface skip msgpack serialization entirely.
+type DirectProposer interface {
+	Proposer
+	ProposeDirect(p *Proposal) (ApplyResult, error)
+}
+
 // ApplyResult is returned from the FSM to the proposing goroutine.
 type ApplyResult struct {
 	Conflict bool
@@ -123,6 +130,7 @@ type Config struct {
 
 	ShutdownTimeout time.Duration
 
-	Metrics *Metrics
-	Logger  io.Writer // nil = discard
+	Metrics   *Metrics
+	Telemetry *Telemetry // nil = disabled
+	Logger    io.Writer  // nil = discard
 }

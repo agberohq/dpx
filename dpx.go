@@ -39,15 +39,16 @@ type KVTx interface {
 
 // Node is a DPX consensus node. Safe for concurrent use after Open().
 type Node struct {
-	proposer shared.Proposer
-	engine   engine.StorageEngine
-	batcher  *Batcher
-	retry    *jack.Retry
-	shutdown *jack.Shutdown
-	watchers *watcherMap
-	metrics  *Metrics
-	clock    *hlc.Clock
-	closed   atomic.Bool
+	proposer  shared.Proposer
+	engine    engine.StorageEngine
+	batcher   *Batcher
+	retry     *jack.Retry
+	shutdown  *jack.Shutdown
+	watchers  *watcherMap
+	metrics   *Metrics
+	telemetry *shared.Telemetry
+	clock     *hlc.Clock
+	closed    atomic.Bool
 }
 
 // Open constructs and starts a DPX Node.
@@ -78,12 +79,13 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 	batcher := newBatcher(cfg.Batch)
 
 	n := &Node{
-		proposer: proposer,
-		engine:   cfg.Engine,
-		batcher:  batcher,
-		watchers: watchers,
-		metrics:  cfg.Metrics,
-		clock:    hlc.NewClock(),
+		proposer:  proposer,
+		engine:    cfg.Engine,
+		batcher:   batcher,
+		watchers:  watchers,
+		metrics:   cfg.Metrics,
+		telemetry: cfg.Telemetry,
+		clock:     hlc.NewClock(),
 	}
 
 	n.retry = jack.NewRetry(
@@ -134,9 +136,13 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 }
 
 func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
+	t0 := time.Now()
 	snap, err := n.engine.GetSnapshot()
 	if err != nil {
 		return fmt.Errorf("dpx: GetSnapshot: %w", err)
+	}
+	if n.telemetry != nil {
+		n.telemetry.GetSnapshot.Record(time.Since(t0))
 	}
 	defer snap.Close()
 
@@ -146,7 +152,11 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 		writes:  make([]shared.WriteEntry, 0, 8),
 	}
 
+	t1 := time.Now()
 	fnErr := fn(tx)
+	if n.telemetry != nil {
+		n.telemetry.Speculate.Record(time.Since(t1))
+	}
 
 	if fnErr != nil {
 		return fnErr
@@ -159,27 +169,39 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	}
 
 	ts := n.clock.Tick()
-	data, err := msgpack.Marshal(&shared.Proposal{
+	proposal := &shared.Proposal{
 		ReadSet:          tx.readSetSlice(),
 		Writes:           tx.writes,
 		TimestampWall:    ts.Wall,
 		TimestampCounter: ts.Counter,
-	})
-	if err != nil {
-		return fmt.Errorf("dpx: marshal: %w", err)
 	}
 
-	if err := n.batcher.Wait(ctx, len(data)); err != nil {
-		return err
+	t3 := time.Now()
+	var res shared.ApplyResult
+	if dp, ok := n.proposer.(shared.DirectProposer); ok {
+		// Fast path: skip msgpack — proposer accepts *Proposal directly.
+		res, err = dp.ProposeDirect(proposal)
+	} else {
+		// Slow path: serialize for network transport (Raft mode).
+		t2 := time.Now()
+		var data []byte
+		data, err = msgpack.Marshal(proposal)
+		if err != nil {
+			return fmt.Errorf("dpx: marshal: %w", err)
+		}
+		if n.telemetry != nil {
+			n.telemetry.Marshal.Record(time.Since(t2))
+		}
+		res, err = n.proposer.Propose(data)
 	}
-
-	start := time.Now()
-	res, err := n.proposer.Propose(data)
 	if err != nil {
 		return err
+	}
+	if n.telemetry != nil {
+		n.telemetry.Propose.Record(time.Since(t3))
 	}
 	if n.metrics != nil {
-		n.metrics.RaftCommitDurationNs.Add(time.Since(start).Nanoseconds())
+		n.metrics.RaftCommitDurationNs.Add(time.Since(t3).Nanoseconds())
 	}
 
 	if res.Err != nil {

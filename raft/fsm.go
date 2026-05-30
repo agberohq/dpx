@@ -71,8 +71,9 @@ type dpxFSM struct {
 	pool      sync.Pool
 	vkBufPool sync.Pool
 
-	watchers shared.WatchNotifier
-	metrics  *shared.Metrics
+	watchers  shared.WatchNotifier
+	metrics   *shared.Metrics
+	telemetry *shared.Telemetry
 }
 
 func newFSM(
@@ -88,6 +89,7 @@ func newFSM(
 		watchers:   watchers,
 		metrics:    metrics,
 		clock:      clock,
+		telemetry:  nil, // wired via setTelemetry after construction
 		state: applyState{
 			// Initialise to empty map. node.Open() calls f.open() immediately
 			// after construction to rebuild from existing engine data on restart.
@@ -102,6 +104,8 @@ func newFSM(
 		},
 	}
 }
+
+func (f *dpxFSM) setTelemetry(t *shared.Telemetry) { f.telemetry = t }
 
 func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
 	start := time.Now()
@@ -182,16 +186,25 @@ func (f *dpxFSM) applyBatch(logs []*hraft.Log) []interface{} {
 			f.clock.Observe(hlc.Timestamp{Wall: proposal.TimestampWall, Counter: proposal.TimestampCounter})
 		}
 
-		if f.detectConflict(&proposal, shadow) {
+		tcd := time.Now()
+		conflict := f.detectConflict(&proposal, shadow)
+		if f.telemetry != nil {
+			f.telemetry.ConflictDetect.Record(time.Since(tcd))
+		}
+		if conflict {
 			results[i] = shared.ApplyResult{Conflict: true}
 			continue
 		}
 
+		tap := time.Now()
 		if err := f.applyProposal(log.Index, &proposal, shadow); err != nil {
 			results[i] = shared.ApplyResult{Err: err}
 			continue
 		}
 
+		if f.telemetry != nil {
+			f.telemetry.ApplyProposal.Record(time.Since(tap))
+		}
 		results[i] = shared.ApplyResult{}
 
 		if f.watchers != nil {
@@ -252,8 +265,12 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow m
 	batch.Set(appliedKey, encodeUint64(index, appliedBuf[:]))
 
 	wo := engine.WriteOptions{Sync: f.syncPolicy == shared.SyncFull}
+	tea := time.Now()
 	if err := f.engine.ApplyBatch(batch, wo); err != nil {
 		return err
+	}
+	if f.telemetry != nil {
+		f.telemetry.EngineApply.Record(time.Since(tea))
 	}
 	f.state.applied = index
 
@@ -267,6 +284,137 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow m
 		f.metrics.ApplyDurationNs.Add(time.Since(start).Nanoseconds())
 	}
 	return nil
+}
+
+// applyProposalToBatch adds one proposal's mutations to a caller-provided engine batch
+// and updates shadow + keyEpoch, but does NOT call engine.ApplyBatch.
+// Used by directProposer.applyBatch to accumulate multiple proposals before one commit.
+// Must only be called from the applierLoop goroutine.
+func (f *dpxFSM) applyProposalToBatch(index uint64, proposal *shared.Proposal, shadow map[string]engine.EpochRecord, batch engine.Batch) error {
+	vkBuf := f.vkBufPool.Get().([]byte)
+	defer f.vkBufPool.Put(vkBuf)
+
+	var epochBuf [9]byte
+	var appliedBuf [8]byte
+
+	for _, w := range proposal.Writes {
+		isCredit := w.Op == shared.OpCredit
+		switch w.Op {
+		case shared.OpSet:
+			batch.Set(w.Key, w.Value)
+		case shared.OpDelete:
+			batch.Delete(w.Key)
+		case shared.OpCredit, shared.OpDebit:
+			batch.Merge(w.Key, w.Value)
+		default:
+			return fmt.Errorf("dpx/raft: unknown WriteOp %d at index %d", w.Op, index)
+		}
+		er := engine.EpochRecord{Epoch: index, IsCredit: isCredit}
+		batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+		shadow[unsafe.String(unsafe.SliceData(w.Key), len(w.Key))] = er
+		f.state.keyEpoch[string(w.Key)] = er
+	}
+	batch.Set(appliedKey, encodeUint64(index, appliedBuf[:]))
+	return nil
+}
+
+// applyBatchDirect applies multiple proposals in a single engine.ApplyBatch call.
+// Called exclusively by directProposer's run() goroutine — no locking needed.
+// Each proposal gets its own conflict check and shadow map slot; all non-conflicting
+// writes are accumulated into one engine batch and committed atomically.
+func (f *dpxFSM) applyBatchDirect(proposals []*shared.Proposal) []shared.ApplyResult {
+	results := make([]shared.ApplyResult, len(proposals))
+
+	shadow := f.pool.Get().(map[string]engine.EpochRecord)
+	defer func() { clear(shadow); f.pool.Put(shadow) }()
+
+	vkBuf := f.vkBufPool.Get().([]byte)
+	defer f.vkBufPool.Put(vkBuf)
+
+	var epochBuf [9]byte
+	var appliedBuf [8]byte
+	batch := f.engine.NewBatch()
+	hasWrites := false
+	start := time.Now()
+
+	for i, p := range proposals {
+		f.state.applied++
+		idx := f.state.applied
+
+		if !p.TimestampIsZero() {
+			f.clock.Observe(hlc.Timestamp{Wall: p.TimestampWall, Counter: p.TimestampCounter})
+		}
+
+		if f.detectConflict(p, shadow) {
+			if f.metrics != nil {
+				f.metrics.ConflictTotal.Add(1)
+			}
+			results[i] = shared.ApplyResult{Conflict: true}
+			continue
+		}
+
+		badOp := false
+		for _, w := range p.Writes {
+			isCredit := w.Op == shared.OpCredit
+			switch w.Op {
+			case shared.OpSet:
+				batch.Set(w.Key, w.Value)
+			case shared.OpDelete:
+				batch.Delete(w.Key)
+			case shared.OpCredit, shared.OpDebit:
+				batch.Merge(w.Key, w.Value)
+			default:
+				results[i] = shared.ApplyResult{Err: fmt.Errorf("dpx/raft: unknown WriteOp %d", w.Op)}
+				badOp = true
+				break
+			}
+			if badOp {
+				break
+			}
+			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
+			batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+			shadow[unsafe.String(unsafe.SliceData(w.Key), len(w.Key))] = er
+			f.state.keyEpoch[string(w.Key)] = er
+		}
+		if badOp {
+			continue
+		}
+
+		batch.Set(appliedKey, encodeUint64(idx, appliedBuf[:]))
+		hasWrites = true
+		results[i] = shared.ApplyResult{}
+	}
+
+	if hasWrites {
+		wo := engine.WriteOptions{Sync: f.syncPolicy == shared.SyncFull}
+		tea := time.Now()
+		if err := f.engine.ApplyBatch(batch, wo); err != nil {
+			for i := range results {
+				if results[i].Err == nil && !results[i].Conflict {
+					results[i] = shared.ApplyResult{Err: err}
+				}
+			}
+			return results
+		}
+		if f.telemetry != nil {
+			f.telemetry.EngineApply.Record(time.Since(tea))
+		}
+		if f.syncPolicy == shared.SyncBatch {
+			f.engine.Sync()
+		}
+		if f.metrics != nil {
+			f.metrics.ApplyDurationNs.Add(time.Since(start).Nanoseconds())
+		}
+	}
+
+	// Notify watchers after batch committed.
+	for i, p := range proposals {
+		if results[i].Err == nil && !results[i].Conflict && f.watchers != nil {
+			f.watchers.NotifyBatch(p.Writes, f.metrics)
+		}
+	}
+
+	return results
 }
 
 func (f *dpxFSM) Snapshot() (hraft.FSMSnapshot, error) {

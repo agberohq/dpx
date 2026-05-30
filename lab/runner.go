@@ -30,6 +30,7 @@ import (
 	"github.com/agberohq/dpx/engine/memory"
 	"github.com/agberohq/dpx/engine/pebble"
 	dpxraft "github.com/agberohq/dpx/raft"
+	"github.com/agberohq/dpx/shared"
 )
 
 var (
@@ -203,6 +204,7 @@ type runConfig struct {
 	mode        string
 	sync        string
 	workload    string
+	telemetry   *shared.Telemetry
 	concurrency int
 	keys        int
 	valueSize   int
@@ -344,6 +346,7 @@ func main() {
 		warmup:      *flagWarmup,
 		duration:    *flagDuration,
 		raftDir:     raftDir,
+		telemetry:   &shared.Telemetry{},
 	}
 
 	fmt.Printf("\n╔═══════════════════════════════════════╗\n")
@@ -375,6 +378,7 @@ func main() {
 	dpxCfg := dpx.Config{
 		SyncPolicy: syncPolicy,
 		RaftDir:    raftDir,
+		Telemetry:  cfg.telemetry,
 	}
 	switch cfg.engine {
 	case "memory":
@@ -420,6 +424,12 @@ func main() {
 	// At 48k transfers/s that is 48000 × 32 = 1.536M KV ops/s needed from DPX.
 	// Each RunInTx in DPX maps to one Raft round-trip regardless of key count.
 	// So Teller batches all 32 stripe ops into one RunInTx = 48k Raft commits/s needed.
+	if cfg.telemetry != nil {
+		fmt.Printf("\n┌─ Stage Breakdown ──────────────────────────────────────────\n")
+		cfg.telemetry.Print(os.Stdout)
+		fmt.Printf("└────────────────────────────────────────────────────────────\n")
+	}
+
 	fmt.Printf("Context — what Teller needs from DPX:\n")
 	fmt.Printf("  Target             : 48,000 RunInTx/s (one Raft commit per Teller transfer)\n")
 	fmt.Printf("  This run           : %.0f RunInTx/s\n", r.tps())

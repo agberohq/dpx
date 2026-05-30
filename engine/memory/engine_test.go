@@ -287,17 +287,21 @@ func TestEngine_CurrentSequenceUpdatedByApplied(t *testing.T) {
 
 func TestEngine_VersionKeyRoutedToVersions(t *testing.T) {
 	e := New()
+	e.Open()
 	b := e.NewBatch()
 	b.Set([]byte("__dpx:ver:mykey"), epochRecord(7, true))
 	e.ApplyBatch(b, engine.WriteOptions{})
 
-	// versions map should have the entry
-	e.mu.RLock()
-	er, ok := e.versions["mykey"]
-	e.mu.RUnlock()
-
-	if !ok {
-		t.Fatal("version record not stored in e.versions")
+	// Version records are stored in the data map as __dpx:ver:{key}.
+	// Retrieve via GetVersion on a snapshot.
+	snap, err := e.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	defer snap.Close()
+	er, err := snap.GetVersion([]byte("mykey"))
+	if err != nil {
+		t.Fatalf("GetVersion: %v", err)
 	}
 	if er.Epoch != 7 {
 		t.Errorf("epoch = %d, want 7", er.Epoch)
@@ -344,11 +348,7 @@ func TestSortedIndex_InsertMaintainsOrder(t *testing.T) {
 		applySet(t, e, k, []byte("v"))
 	}
 
-	e.mu.RLock()
-	idx := make([]string, len(e.keys))
-	copy(idx, e.keys)
-	e.mu.RUnlock()
-
+	idx := e.currentKeys()
 	if !sort.StringsAreSorted(idx) {
 		t.Errorf("index not sorted: %v", idx)
 	}
@@ -359,14 +359,12 @@ func TestSortedIndex_InsertDuplicateIsNoop(t *testing.T) {
 	applySet(t, e, "k", []byte("v1"))
 	applySet(t, e, "k", []byte("v2")) // same key, different value
 
-	e.mu.RLock()
 	count := 0
-	for _, k := range e.keys {
+	for _, k := range e.currentKeys() {
 		if k == "k" {
 			count++
 		}
 	}
-	e.mu.RUnlock()
 
 	if count != 1 {
 		t.Errorf("key appeared %d times in index, want 1", count)
@@ -380,10 +378,7 @@ func TestSortedIndex_DeleteRemovesKey(t *testing.T) {
 	applySet(t, e, "c", []byte("3"))
 	applyDel(t, e, "b")
 
-	e.mu.RLock()
-	keys := make([]string, len(e.keys))
-	copy(keys, e.keys)
-	e.mu.RUnlock()
+	keys := e.currentKeys()
 
 	for _, k := range keys {
 		if k == "b" {

@@ -48,9 +48,8 @@ func TestNode_SingleNode_Propose(t *testing.T) {
 	}
 }
 
-// TestNode_LeaderPropose verifies that a single-node cluster bootstraps,
-// elects itself leader, and accepts proposals. The non-leader rejection path
-// is only reachable in multi-node clusters and is tested via the error message.
+// TestNode_LeaderPropose verifies that a single-node embedded open succeeds
+// and immediately accepts proposals (no election wait needed — directProposer).
 func TestNode_LeaderPropose(t *testing.T) {
 	eng := memory.New()
 	cfg := shared.Config{
@@ -58,15 +57,22 @@ func TestNode_LeaderPropose(t *testing.T) {
 		Engine: eng,
 	}
 
-	node, err := Open(cfg, eng, nil)
+	proposer, err := Open(cfg, eng, nil)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer node.Shutdown()
+	defer proposer.Shutdown()
 
-	// Single-node Open() waits for leader election before returning.
-	if s := node.(*Node).State(); s != "Leader" {
-		t.Errorf("expected Leader state, got %s", s)
+	// directProposer accepts proposals immediately — no leader election needed.
+	p := &shared.Proposal{
+		Writes: []shared.WriteEntry{
+			{Op: shared.OpSet, Key: []byte("probe"), Value: []byte("ok")},
+		},
+	}
+	data, _ := msgpack.Marshal(p)
+	_, err = proposer.Propose(data)
+	if err != nil {
+		t.Errorf("Propose on embedded node: %v", err)
 	}
 }
 

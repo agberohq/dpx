@@ -56,7 +56,8 @@ type Config struct {
 	Retry           RetryConfig
 	ShutdownTimeout time.Duration
 
-	Metrics *Metrics
+	Metrics   *Metrics
+	Telemetry *shared.Telemetry // nil = disabled; captures per-stage latency
 
 	// Logger is the parent application's logger (e.g. Teller's ll.Logger).
 	// Raft internals write to it. nil = discard.
@@ -75,6 +76,7 @@ func (c Config) toShared() shared.Config {
 		SyncPolicy:      c.SyncPolicy,
 		ShutdownTimeout: c.ShutdownTimeout,
 		Metrics:         c.Metrics,
+		Telemetry:       c.Telemetry,
 		Logger:          llWriter(c.Logger),
 	}
 }
