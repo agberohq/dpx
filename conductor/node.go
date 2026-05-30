@@ -1,4 +1,4 @@
-package raft
+package conductor
 
 import (
 	"fmt"
@@ -20,17 +20,26 @@ type Node struct {
 	raft      *hraft.Raft
 	fsm       *dpxFSM
 	transport hraft.Transport
-	logDB     io.Closer // *raftboltdb.BoltStore or nil (inmem)
-	stableDB  io.Closer // *raftboltdb.BoltStore or nil (inmem)
+	logDB     io.Closer
+	stableDB  io.Closer
 	dir       string
 }
 
 // Open creates a Raft node. Single-node embedded mode (empty Peers) uses
-// in-memory transport and log/stable stores — no TCP, no BoltDB, no disk I/O
-// on the Raft path. Multi-node sets ListenAddr + Peers and uses TCP + BoltDB.
+// directProposer (non-sharded engine) or shardedDirectProposer (sharded engine)
+// for zero-Raft-overhead execution. Multi-node uses full HashiCorp Raft.
 func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (shared.Proposer, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = "1"
+	}
+
+	// Embedded single-node: bypass HashiCorp Raft entirely.
+	// Use sharded proposer if engine supports sharding, else single proposer.
+	if len(cfg.Peers) == 0 {
+		if isShardedEngine(eng) {
+			return newShardedDirectProposer(eng, cfg.SyncPolicy, w, cfg.Metrics, cfg.Telemetry)
+		}
+		return newDirectProposer(eng, cfg.SyncPolicy, w, cfg.Metrics, cfg.Telemetry)
 	}
 
 	rCfg := hraft.DefaultConfig()
@@ -41,19 +50,13 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		rCfg.LogOutput = io.Discard
 	}
 
-	// Tuning for embedded single-process use.
-	// BatchApplyCh: raft collects all pending Apply() calls and delivers them
-	// to ApplyBatch() in one shot — our FSM handles this natively.
-	// CommitTimeout: how long the leader waits before flushing a partial batch.
-	// 1ms instead of 50ms default = 50x less idle latency under low concurrency.
 	rCfg.BatchApplyCh = true
 	rCfg.CommitTimeout = 1 * time.Millisecond
 	rCfg.HeartbeatTimeout = 50 * time.Millisecond
 	rCfg.ElectionTimeout = 50 * time.Millisecond
-	rCfg.LeaderLeaseTimeout = 40 * time.Millisecond // must be <= HeartbeatTimeout
+	rCfg.LeaderLeaseTimeout = 40 * time.Millisecond
 	rCfg.MaxAppendEntries = 256
 
-	// FSM owns its own HLC clock — no shared.Clock interface needed.
 	clock := hlc.NewClock()
 	f := newFSM(eng, cfg.SyncPolicy, w, cfg.Metrics, clock)
 	if _, err := f.open(nil); err != nil {
@@ -69,12 +72,6 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		return nil, fmt.Errorf("raft: snapshot store: %w", err)
 	}
 
-	// Embedded single-node: bypass Raft entirely.
-	// directProposer gives the same OCC semantics with zero channel overhead.
-	if len(cfg.Peers) == 0 {
-		return newDirectProposer(eng, cfg.SyncPolicy, w, cfg.Metrics, cfg.Telemetry)
-	}
-
 	var (
 		transport    hraft.Transport
 		logStore     hraft.LogStore
@@ -84,7 +81,6 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 	)
 
 	{
-		// ── Multi-node: TCP transport + BoltDB persistent stores ──
 		listenAddr := cfg.ListenAddr
 		if listenAddr == "" {
 			listenAddr = "127.0.0.1:0"
@@ -145,7 +141,6 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		return nil, fmt.Errorf("raft: new raft: %w", err)
 	}
 
-	// Bootstrap — multi-node only (embedded returns early above).
 	var servers []hraft.Server
 	for id, addr := range cfg.Peers {
 		servers = append(servers, hraft.Server{
@@ -155,7 +150,6 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 	}
 	r.BootstrapCluster(hraft.Configuration{Servers: servers})
 
-	// Wait for leader election. Single-node: ~few ms. Multi-node: up to 5s timeout.
 	select {
 	case <-r.LeaderCh():
 	case <-time.After(5 * time.Second):
@@ -170,6 +164,21 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 	}, nil
 }
 
+// isShardedEngine reports whether eng is a sharded memory engine.
+// Uses type assertion; returns false for pebble, badger, or non-sharded memory.
+func isShardedEngine(eng engine.StorageEngine) bool {
+	// We cannot import engine/memory here (would create import cycle).
+	// Instead, use a marker interface or type assertion via reflection.
+	// The cleanest approach: check for a method only sharded engines have.
+	type shardedMarker interface {
+		IsSharded() bool
+	}
+	if s, ok := eng.(shardedMarker); ok {
+		return s.IsSharded()
+	}
+	return false
+}
+
 func snapshotDir(cfg shared.Config) (string, error) {
 	if cfg.RaftDir != "" {
 		if err := os.MkdirAll(cfg.RaftDir, 0755); err != nil {
@@ -177,7 +186,6 @@ func snapshotDir(cfg shared.Config) (string, error) {
 		}
 		return cfg.RaftDir, nil
 	}
-	// Embedded mode: unique temp dir per node instance.
 	dir, err := os.MkdirTemp("", "dpx-snap-"+cfg.NodeID+"-*")
 	return dir, err
 }

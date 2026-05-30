@@ -1,4 +1,4 @@
-package raft
+package conductor
 
 import (
 	"errors"
@@ -18,6 +18,7 @@ var errDirectClosed = errors.New("dpx/raft: direct proposer closed")
 type proposalEntry struct {
 	p        *shared.Proposal
 	resultCh chan shared.ApplyResult
+	accStart time.Time // <-- ADDED: tracks when entry joined batch for DirectAccumulate
 }
 
 // directProposer bypasses HashiCorp Raft for single-node embedded mode.
@@ -28,10 +29,9 @@ type proposalEntry struct {
 // Multiple concurrent proposals are applied in one engine.ApplyBatch call,
 // amortizing the sharded-clone cost across the batch.
 type directProposer struct {
-	fsm    *dpxFSM
-	closed atomic.Bool
-	index  uint64 // monotone log index — only touched by applierLoop goroutine
-
+	fsm      *dpxFSM
+	closed   atomic.Bool
+	index    uint64 // monotone log index — only touched by applierLoop goroutine
 	submitCh chan *proposalEntry
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -39,8 +39,8 @@ type directProposer struct {
 
 const (
 	submitBufSize = 4096
-	maxBatchSize  = 512
-	flushInterval = 50 * time.Microsecond // max latency added by batcher
+	maxBatchSize  = 2048
+	flushInterval = 240 * time.Nanosecond
 )
 
 func newDirectProposer(
@@ -71,17 +71,33 @@ func (d *directProposer) ProposeDirect(p *shared.Proposal) (shared.ApplyResult, 
 	if d.closed.Load() {
 		return shared.ApplyResult{}, errDirectClosed
 	}
+
+	var t0 time.Time
 	entry := &proposalEntry{
 		p:        p,
 		resultCh: make(chan shared.ApplyResult, 1),
 	}
+
+	// Start timing round-trip
+	if d.fsm.telemetry != nil {
+		t0 = time.Now()
+		entry.accStart = t0
+	}
+
 	select {
 	case d.submitCh <- entry:
+		if d.fsm.telemetry != nil {
+			d.fsm.telemetry.DirectSubmit.Record(time.Since(t0))
+		}
 	case <-d.done:
 		return shared.ApplyResult{}, errDirectClosed
 	}
+
 	select {
 	case res := <-entry.resultCh:
+		if d.fsm.telemetry != nil {
+			d.fsm.telemetry.DirectRoundTrip.Record(time.Since(t0))
+		}
 		return res, nil
 	case <-d.done:
 		return shared.ApplyResult{}, errDirectClosed
@@ -101,10 +117,9 @@ func (d *directProposer) Propose(data []byte) (shared.ApplyResult, error) {
 }
 
 // Shutdown drains in-flight proposals and stops the applierLoop goroutine.
-// Safe to call multiple times.
 func (d *directProposer) Shutdown() error {
 	if !d.closed.CompareAndSwap(false, true) {
-		return nil // already shut down
+		return nil
 	}
 	close(d.done)
 	d.wg.Wait()
@@ -112,11 +127,8 @@ func (d *directProposer) Shutdown() error {
 }
 
 // applierLoop is the single goroutine that owns FSM state.
-// It drains submitCh in batches, applying all queued proposals in one
-// engine.ApplyBatch call.
 func (d *directProposer) applierLoop() {
 	defer d.wg.Done()
-
 	batch := make([]*proposalEntry, 0, maxBatchSize)
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
@@ -125,9 +137,13 @@ func (d *directProposer) applierLoop() {
 		if len(batch) == 0 {
 			return
 		}
+		// Record accumulation time for the first entry in the batch
+		if d.fsm.telemetry != nil && len(batch) > 0 {
+			d.fsm.telemetry.DirectAccumulate.Record(time.Since(batch[0].accStart))
+		}
 		d.applyBatch(batch)
 		for i := range batch {
-			batch[i] = nil // release reference for GC
+			batch[i] = nil
 		}
 		batch = batch[:0]
 	}
@@ -137,13 +153,10 @@ func (d *directProposer) applierLoop() {
 		case <-d.done:
 			flush()
 			return
-
 		case <-ticker.C:
 			flush()
-
 		case entry := <-d.submitCh:
 			batch = append(batch, entry)
-			// Non-blocking drain: collect everything already queued.
 		drain:
 			for len(batch) < maxBatchSize {
 				select {
@@ -161,29 +174,24 @@ func (d *directProposer) applierLoop() {
 }
 
 // applyBatch applies a batch of proposals in one engine.ApplyBatch call.
-// Only called from applierLoop — no locking needed.
 func (d *directProposer) applyBatch(entries []*proposalEntry) {
 	shadow := d.fsm.pool.Get().(map[string]engine.EpochRecord)
 	defer func() {
 		clear(shadow)
 		d.fsm.pool.Put(shadow)
 	}()
-
 	batch := d.fsm.engine.NewBatch()
 	results := make([]shared.ApplyResult, len(entries))
 	hasWrites := false
-
 	for i, entry := range entries {
 		d.index++
 		idx := d.index
-
 		if !entry.p.TimestampIsZero() {
 			d.fsm.clock.Observe(hlc.Timestamp{
 				Wall:    entry.p.TimestampWall,
 				Counter: entry.p.TimestampCounter,
 			})
 		}
-
 		if d.fsm.detectConflict(entry.p, shadow) {
 			if d.fsm.metrics != nil {
 				d.fsm.metrics.ConflictTotal.Add(1)
@@ -191,16 +199,13 @@ func (d *directProposer) applyBatch(entries []*proposalEntry) {
 			results[i] = shared.ApplyResult{Conflict: true}
 			continue
 		}
-
 		if err := d.fsm.applyProposalToBatch(idx, entry.p, shadow, batch); err != nil {
 			results[i] = shared.ApplyResult{Err: err}
 			continue
 		}
-
 		hasWrites = true
 		results[i] = shared.ApplyResult{}
 	}
-
 	if hasWrites {
 		wo := engine.WriteOptions{Sync: d.fsm.syncPolicy == shared.SyncFull}
 		t0 := time.Now()
@@ -220,8 +225,6 @@ func (d *directProposer) applyBatch(entries []*proposalEntry) {
 			}
 		}
 	}
-
-	// Notify watchers and return results.
 	for i, entry := range entries {
 		if results[i].Err == nil && !results[i].Conflict && d.fsm.watchers != nil {
 			d.fsm.watchers.NotifyBatch(entry.p.Writes, d.fsm.metrics)

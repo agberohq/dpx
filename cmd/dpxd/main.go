@@ -19,8 +19,8 @@ import (
 	"os"
 
 	"github.com/agberohq/dpx"
+	dpxraft "github.com/agberohq/dpx/conductor"
 	"github.com/agberohq/dpx/engine/pebble"
-	dpxraft "github.com/agberohq/dpx/raft"
 )
 
 func main() {

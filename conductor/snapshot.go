@@ -1,4 +1,4 @@
-package raft
+package conductor
 
 import (
 	"archive/tar"
