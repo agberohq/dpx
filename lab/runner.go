@@ -47,7 +47,7 @@ var (
 	flagValueSize   = flag.Int("value", 64, "value size in bytes")
 )
 
-// ── Latency histogram ────────────────────────────────────────────────────────
+// Latency histogram
 
 type histogram struct {
 	mu      sync.Mutex
@@ -95,7 +95,7 @@ func avg(s []int64) time.Duration {
 	return time.Duration(sum / int64(len(s)))
 }
 
-// ── Workloads ────────────────────────────────────────────────────────────────
+// Workloads
 // DPX is a KV store. Workloads measure raw KV throughput only.
 // No balance checks, no business logic — that belongs in Teller.
 
@@ -156,7 +156,7 @@ func workloadMixed(ctx context.Context, node *dpx.Node, keys int, valueSize int,
 	}
 }
 
-// ── Runner ───────────────────────────────────────────────────────────────────
+// Runner
 
 type result struct {
 	engine      string
@@ -303,7 +303,7 @@ func isConflictExhausted(err error) bool {
 	return err != nil && err == dpx.ErrConflictExhausted
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+// Main
 
 func main() {
 	flag.Parse()
