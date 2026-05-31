@@ -1,6 +1,7 @@
 package conductor
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +14,21 @@ import (
 	hraft "github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/olekukonko/hlc"
+	"github.com/olekukonko/jack"
 )
+
+// raftInFlightLimit caps concurrent proposals in the distributed Raft pipeline.
+// Sized to MaxAppendEntries (256): Raft pipelines at most that many log entries
+// per AppendEntries RPC, so more in-flight proposals than this just piles up
+// BoltDB writes without increasing commit throughput.
+const raftInFlightLimit = 256
+
+// raftAcquireTimeout is the maximum time a caller will wait for a semaphore
+// slot before giving up. This prevents the infinite hang that occurred with
+// context.Background() when Raft was slow or not-leader.
+// 10s matches the raft.Apply timeout so callers never wait longer for admission
+// than they would for the commit itself.
+const raftAcquireTimeout = 10 * time.Second
 
 // Node implements shared.Proposer using HashiCorp Raft.
 type Node struct {
@@ -23,18 +38,24 @@ type Node struct {
 	logDB     io.Closer
 	stableDB  io.Closer
 	dir       string
+
+	// sem provides backpressure for distributed mode only.
+	// Callers block here (CoDel-aware, priority-ordered) rather than
+	// receiving errors when the BoltDB WAL pipeline is saturated.
+	// Sized to raftInFlightLimit = MaxAppendEntries = 256.
+	sem *jack.Semaphore
 }
 
 // Open creates a Raft node. Single-node embedded mode (empty Peers) uses
-// directProposer (non-sharded engine) or shardedDirectProposer (sharded engine)
-// for zero-Raft-overhead execution. Multi-node uses full HashiCorp Raft.
+// directProposer / shardedDirectProposer. Multi-node uses full HashiCorp Raft.
 func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (shared.Proposer, error) {
 	if cfg.NodeID == "" {
 		cfg.NodeID = "1"
 	}
 
 	// Embedded single-node: bypass HashiCorp Raft entirely.
-	// Use sharded proposer if engine supports sharding, else single proposer.
+	// No semaphore — the directProposer channel + drain loop handles
+	// backpressure and a semaphore adds measurable hot-path overhead.
 	if len(cfg.Peers) == 0 {
 		if isShardedEngine(eng) {
 			return newShardedDirectProposer(eng, cfg.SyncPolicy, w, cfg.Metrics, cfg.Telemetry)
@@ -161,15 +182,16 @@ func Open(cfg shared.Config, eng engine.StorageEngine, w shared.WatchNotifier) (
 		transport: transport,
 		logDB:     logCloser,
 		stableDB:  stableCloser,
+		sem: jack.NewSemaphore(
+			raftInFlightLimit,
+			jack.SemaphoreWithTargetSojourn(5*time.Millisecond),
+			jack.SemaphoreWithMaxSojourn(raftAcquireTimeout),
+		),
 	}, nil
 }
 
 // isShardedEngine reports whether eng is a sharded memory engine.
-// Uses type assertion; returns false for pebble, badger, or non-sharded memory.
 func isShardedEngine(eng engine.StorageEngine) bool {
-	// We cannot import engine/memory here (would create import cycle).
-	// Instead, use a marker interface or type assertion via reflection.
-	// The cleanest approach: check for a method only sharded engines have.
 	type shardedMarker interface {
 		IsSharded() bool
 	}
@@ -190,11 +212,29 @@ func snapshotDir(cfg shared.Config) (string, error) {
 	return dir, err
 }
 
+// Propose submits data to the Raft cluster with backpressure.
+//
+// Admission control: callers block in jack's CoDel-aware semaphore rather
+// than hammering raft.Apply with more proposals than the WAL pipeline can
+// absorb. A bounded timeout prevents infinite waits if Raft is unhealthy.
+//
+// Leader check is intentionally done after acquiring the semaphore slot:
+// checking before acquiring creates a TOCTOU race where the node can lose
+// leadership between the check and raft.Apply. Letting raft.Apply return
+// ErrNotLeader is the correct single-check point.
 func (n *Node) Propose(data []byte) (shared.ApplyResult, error) {
-	if n.raft.State() != hraft.Leader {
-		return shared.ApplyResult{}, fmt.Errorf("dpx/raft: not the leader")
+	// Acquire with a timeout so callers never block forever if Raft is
+	// stuck (e.g. no quorum, leadership lost during warmup/seeding).
+	ctx, cancel := context.WithTimeout(context.Background(), raftAcquireTimeout)
+	defer cancel()
+
+	if err := n.sem.Acquire(ctx, jack.PriorityHigh); err != nil {
+		// sem.Close() on Shutdown, or timeout waiting for a slot.
+		return shared.ApplyResult{}, fmt.Errorf("raft: admission: %w", err)
 	}
-	future := n.raft.Apply(data, 10*time.Second)
+	defer n.sem.Release()
+
+	future := n.raft.Apply(data, raftAcquireTimeout)
 	if err := future.Error(); err != nil {
 		return shared.ApplyResult{}, fmt.Errorf("raft: apply: %w", err)
 	}
@@ -207,6 +247,8 @@ func (n *Node) Propose(data []byte) (shared.ApplyResult, error) {
 }
 
 func (n *Node) Shutdown() error {
+	// Close the semaphore first to unblock goroutines waiting in Acquire.
+	n.sem.Close()
 	if err := n.raft.Shutdown().Error(); err != nil {
 		return fmt.Errorf("raft: shutdown: %w", err)
 	}

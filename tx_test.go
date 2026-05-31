@@ -115,6 +115,9 @@ func decode64tx(b []byte) int64 {
 	return int64(binary.LittleEndian.Uint64(b))
 }
 
+// TestTx_Get_PopulatesReadSet verifies that tx.Get records the key in the
+// readSet with a sentinel epoch=0 immediately, and that readSetSlice() hydrates
+// it to the real epoch (deferred GetVersion optimisation).
 func TestTx_Get_PopulatesReadSet(t *testing.T) {
 	snap := newFakeSnapshot(10)
 	snap.set("alice", le64tx(100), 5, false)
@@ -134,11 +137,61 @@ func TestTx_Get_PopulatesReadSet(t *testing.T) {
 	if !ok {
 		t.Fatal("key not in readSet after Get")
 	}
-	if re.Epoch != 5 {
-		t.Errorf("readSet epoch = %d, want 5", re.Epoch)
+	// Epoch is deferred: sentinel 0 is stored immediately after Get.
+	// The real epoch (5) is only hydrated in readSetSlice().
+	if re.Epoch != 0 {
+		t.Errorf("readSet epoch after Get = %d, want 0 (deferred sentinel)", re.Epoch)
 	}
 	if re.IsDebit {
 		t.Error("Get should not set IsDebit=true")
+	}
+}
+
+// TestTx_Get_EpochHydratedInReadSetSlice verifies that readSetSlice() fills in
+// the real epoch for entries recorded with the deferred sentinel.
+func TestTx_Get_EpochHydratedInReadSetSlice(t *testing.T) {
+	snap := newFakeSnapshot(10)
+	snap.set("alice", le64tx(100), 5, false)
+
+	tx := newTx(snap)
+	ctx := context.Background()
+
+	_, err := tx.Get(ctx, []byte("alice"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Simulate a write so readSetSlice is called (it's only meaningful when
+	// there are writes to propose — pure read-only txns skip Propose).
+	_ = tx.Set(ctx, []byte("other"), []byte("v"))
+
+	rs := tx.readSetSlice()
+	if len(rs) != 1 {
+		t.Fatalf("readSetSlice len = %d, want 1", len(rs))
+	}
+	if rs[0].Epoch != 5 {
+		t.Errorf("hydrated epoch = %d, want 5", rs[0].Epoch)
+	}
+}
+
+// TestTx_Get_ReadOnlyTxNeverPaysVersionCost verifies that a purely read-only
+// transaction (no writes) never calls readSetSlice, so the deferred GetVersion
+// is never paid. This is checked by confirming the readSet sentinel is still 0
+// and that empty() returns true when no writes are buffered.
+func TestTx_Get_ReadOnlyTxNeverPaysVersionCost(t *testing.T) {
+	snap := newFakeSnapshot(10)
+	snap.set("alice", le64tx(100), 5, false)
+
+	tx := newTx(snap)
+	_, _ = tx.Get(context.Background(), []byte("alice"))
+
+	// No writes: empty() is true, so runOnce never calls readSetSlice.
+	if !tx.empty() {
+		t.Error("read-only tx should report empty()")
+	}
+	// Sentinel is still 0 — GetVersion was never called.
+	re := tx.readSet["alice"]
+	if re.Epoch != 0 {
+		t.Errorf("sentinel should stay 0 for pure read tx, got %d", re.Epoch)
 	}
 }
 
@@ -273,6 +326,7 @@ func TestTx_AtomicAdd_Debit_InReadSet(t *testing.T) {
 	if !re.IsDebit {
 		t.Error("readSet entry should have IsDebit=true for debit")
 	}
+	// Debit is NOT deferred — epoch is fetched eagerly in AtomicAdd.
 	if re.Epoch != 3 {
 		t.Errorf("epoch = %d, want 3", re.Epoch)
 	}
@@ -442,6 +496,29 @@ func TestTx_ReadSetSlice_ContainsAllEntries(t *testing.T) {
 	rs := tx.readSetSlice()
 	if len(rs) != 2 {
 		t.Fatalf("readSetSlice len = %d, want 2", len(rs))
+	}
+}
+
+// TestTx_ReadSetSlice_HydratesEpochFromGet verifies that readSetSlice fills in
+// the real epoch for Get entries that used the deferred sentinel.
+func TestTx_ReadSetSlice_HydratesEpochFromGet(t *testing.T) {
+	snap := newFakeSnapshot(10)
+	snap.set("x", le64tx(42), 7, false)
+
+	tx := newTx(snap)
+	_, _ = tx.Get(context.Background(), []byte("x"))
+
+	// Sentinel epoch should be 0 immediately after Get.
+	if tx.readSet["x"].Epoch != 0 {
+		t.Fatalf("sentinel should be 0 after Get, got %d", tx.readSet["x"].Epoch)
+	}
+
+	rs := tx.readSetSlice()
+	if len(rs) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(rs))
+	}
+	if rs[0].Epoch != 7 {
+		t.Errorf("hydrated epoch = %d, want 7", rs[0].Epoch)
 	}
 }
 

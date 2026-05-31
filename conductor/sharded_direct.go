@@ -23,7 +23,7 @@ type shardedDirectProposer struct {
 }
 
 // numShards must match engine/memory.numShards.
-const numShards = 32
+const numShards = 64
 
 func newShardedDirectProposer(
 	eng engine.StorageEngine,
@@ -34,7 +34,7 @@ func newShardedDirectProposer(
 ) (*shardedDirectProposer, error) {
 	s := &shardedDirectProposer{}
 	for i := range s.shards {
-		dp, err := newDirectProposer(eng, syncPolicy, w, metrics, telemetry)
+		dp, err := newDirectProposerWithInterval(eng, syncPolicy, w, metrics, telemetry, shardedFlushInterval)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				s.shards[j].Shutdown()
@@ -96,8 +96,6 @@ func (s *shardedDirectProposer) Shutdown() error {
 // shardFor mirrors engine/memory.shardFor for routing consistency.
 // Uses FNV-1a hash of the key, masked to numShards-1.
 func shardFor(key string) int {
-	// Inline the hash to avoid importing engine/memory and creating a cycle.
-	// FNV-1a 32-bit hash.
 	const offset32 = 2166136261
 	const prime32 = 16777619
 	h := uint32(offset32)

@@ -26,7 +26,6 @@ import (
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/dgraph-io/badger/v4"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Engine is the Badger-backed StorageEngine.
@@ -173,7 +172,7 @@ func (e *Engine) CurrentSequence() uint64 {
 	return binary.LittleEndian.Uint64(val)
 }
 
-// CreateCheckpoint serialises the current database state to dir/dump as msgpack.
+// CreateCheckpoint serialises the current database state to dir/dump.
 // Badger's built-in backup streams to an io.Writer; we capture it to a file.
 //
 // Unlike Pebble's hard-link checkpoint, this is a full data copy.
@@ -184,8 +183,7 @@ func (e *Engine) CreateCheckpoint(dir string) error {
 		return err
 	}
 
-	// Collect all key-value pairs into a map and serialise as msgpack.
-	// This matches the memory engine format and makes restore straightforward.
+	// Collect all key-value pairs and serialise using the shared binary codec.
 	data := make(map[string][]byte)
 	err := e.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -206,10 +204,7 @@ func (e *Engine) CreateCheckpoint(dir string) error {
 		return err
 	}
 
-	b, err := msgpack.Marshal(data)
-	if err != nil {
-		return err
-	}
+	b := encodeDump(data)
 	return os.WriteFile(filepath.Join(dir, "dump"), b, 0o600)
 }
 

@@ -55,7 +55,6 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 	}
 	applyDefaults(&cfg)
 
-	// Timer: EngineOpen
 	var engineOpenStart time.Time
 	if cfg.Telemetry != nil {
 		engineOpenStart = time.Now()
@@ -67,7 +66,6 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 		cfg.Telemetry.EngineOpen.Record(time.Since(engineOpenStart))
 	}
 
-	// Wire telemetry into the engine for internal stage recording
 	if cfg.Telemetry != nil {
 		cfg.Engine.SetTelemetry(cfg.Telemetry)
 	}
@@ -75,7 +73,6 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 	watchers := newWatcherMap(cfg.Telemetry)
 	sharedCfg := cfg.toShared()
 
-	// Timer: RaftBootstrap
 	var raftStart time.Time
 	if cfg.Telemetry != nil {
 		raftStart = time.Now()
@@ -124,7 +121,6 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 		}
 	}
 
-	// Timer: ShutdownRaft
 	mustRegister("raft", 0, func(_ context.Context) error {
 		if n.telemetry != nil {
 			t0 := time.Now()
@@ -135,7 +131,6 @@ func Open(cfg Config, newProposer shared.ProposerFactory) (*Node, error) {
 
 	mustRegister("watchers", 1, func(_ context.Context) error { watchers.closeAll(); return nil })
 
-	// Timer: ShutdownEngine
 	mustRegister("engine", 2, func(_ context.Context) error {
 		if n.telemetry != nil {
 			t0 := time.Now()
@@ -166,7 +161,6 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 		return n.runOnce(ctx, fn)
 	})
 
-	// Record retry backoff = wall clock time minus actual execution time
 	if n.telemetry != nil {
 		if backoff := time.Since(retryStart) - totalExec; backoff > 0 {
 			n.telemetry.RetryBackoff.Record(backoff)
@@ -185,7 +179,6 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	t0 := time.Now()
 
-	// Timer: SnapshotCreate (Engine-specific)
 	var snapStart time.Time
 	if n.telemetry != nil {
 		snapStart = time.Now()
@@ -197,7 +190,6 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 	if n.telemetry != nil {
 		n.telemetry.SnapshotCreate.Record(time.Since(snapStart))
 	}
-	// Existing timer: GetSnapshot (covers dpx overhead + engine call)
 	if n.telemetry != nil {
 		n.telemetry.GetSnapshot.Record(time.Since(t0))
 	}
@@ -240,11 +232,8 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 		res, err = dp.ProposeDirect(proposal)
 	} else {
 		t2 := time.Now()
-		var data []byte
-		data = proposal.Marshal()
-		//if err != nil {
-		//	return fmt.Errorf("dpx: marshal: %w", err)
-		//}
+		// Native zero-reflection marshal.
+		data := proposal.Marshal()
 		if n.telemetry != nil {
 			n.telemetry.Marshal.Record(time.Since(t2))
 		}
@@ -323,7 +312,6 @@ func (n *Node) Backup(_ context.Context, destDir string) error {
 		return ErrStoreClosed
 	}
 
-	// Timer: EngineSync
 	var syncStart time.Time
 	if n.telemetry != nil {
 		syncStart = time.Now()
@@ -335,7 +323,6 @@ func (n *Node) Backup(_ context.Context, destDir string) error {
 		n.telemetry.EngineSync.Record(time.Since(syncStart))
 	}
 
-	// Timer: SnapshotCreate (Backup path)
 	var snapStart time.Time
 	if n.telemetry != nil {
 		snapStart = time.Now()

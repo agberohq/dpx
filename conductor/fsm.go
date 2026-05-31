@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -16,7 +17,6 @@ import (
 	"github.com/agberohq/dpx/shared"
 	hraft "github.com/hashicorp/raft"
 	"github.com/olekukonko/hlc"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -56,12 +56,17 @@ func encodeUint64(v uint64, buf []byte) []byte {
 	return b
 }
 
+// applyState is owned exclusively by phase A (applierLoop / applyBatch).
+// It must never be accessed from any other goroutine.
 type applyState struct {
 	keyEpoch map[string]engine.EpochRecord
-	applied  uint64
 }
 
 type dpxFSM struct {
+	// applied is updated by phase B (writeLoop / applyProposalToBatch) after
+	// a successful engine commit. Atomic so CurrentSequence reads are safe
+	// from any goroutine without holding any lock.
+	applied    atomic.Uint64
 	engine     engine.StorageEngine
 	state      applyState
 	syncPolicy shared.SyncPolicy
@@ -71,6 +76,7 @@ type dpxFSM struct {
 	watchers   shared.WatchNotifier
 	metrics    *shared.Metrics
 	telemetry  *shared.Telemetry
+	skipHLC    bool // true for embedded mode: skip clock.Observe
 }
 
 func newFSM(
@@ -86,7 +92,7 @@ func newFSM(
 		watchers:   watchers,
 		metrics:    metrics,
 		clock:      clock,
-		telemetry:  nil, // wired via setTelemetry after construction
+		telemetry:  nil,
 		state: applyState{
 			keyEpoch: make(map[string]engine.EpochRecord, 1<<10),
 		},
@@ -102,11 +108,7 @@ func newFSM(
 func (f *dpxFSM) setTelemetry(t *shared.Telemetry) { f.telemetry = t }
 
 func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
-	// Timer: KeyEpochRebuild
 	start := time.Now()
-	if f.telemetry != nil {
-		// If already initialized elsewhere, this ensures we capture it here
-	}
 
 	f.state.keyEpoch = make(map[string]engine.EpochRecord, 1<<16)
 	iter := f.engine.RawIter(rawIterStart, rawIterEnd)
@@ -136,7 +138,7 @@ func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
 	if err := iter.Error(); err != nil {
 		return 0, fmt.Errorf("dpx/raft: open scan: %w", err)
 	}
-	f.state.applied = f.engine.CurrentSequence()
+	f.applied.Store(f.engine.CurrentSequence())
 
 	if f.telemetry != nil {
 		f.telemetry.KeyEpochRebuild.Record(time.Since(start))
@@ -144,7 +146,7 @@ func (f *dpxFSM) open(stopc <-chan struct{}) (uint64, error) {
 	if f.metrics != nil {
 		f.metrics.KeyEpochRebuildDurationNs.Add(time.Since(start).Nanoseconds())
 	}
-	return f.state.applied, nil
+	return f.applied.Load(), nil
 }
 
 func (f *dpxFSM) Apply(log *hraft.Log) interface{} {
@@ -173,14 +175,14 @@ func (f *dpxFSM) applyBatch(logs []*hraft.Log) []interface{} {
 		}
 
 		var proposal shared.Proposal
-		if err := msgpack.Unmarshal(log.Data, &proposal); err != nil {
+		if err := proposal.Unmarshal(log.Data); err != nil {
 			results[i] = shared.ApplyResult{
 				Err: fmt.Errorf("dpx/raft: corrupt entry at index %d: %w", log.Index, err),
 			}
 			continue
 		}
 
-		if !proposal.TimestampIsZero() {
+		if !f.skipHLC && !proposal.TimestampIsZero() {
 			f.clock.Observe(hlc.Timestamp{Wall: proposal.TimestampWall, Counter: proposal.TimestampCounter})
 		}
 
@@ -265,9 +267,8 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow m
 		f.telemetry.EngineApply.Record(time.Since(tea))
 	}
 
-	f.state.applied = index
+	f.applied.Store(index)
 	if f.syncPolicy == shared.SyncBatch {
-		// Timer: EngineSync
 		var syncStart time.Time
 		if f.telemetry != nil {
 			syncStart = time.Now()
@@ -316,7 +317,6 @@ func (f *dpxFSM) applyProposalToBatch(index uint64, proposal *shared.Proposal, s
 }
 
 func (f *dpxFSM) Snapshot() (hraft.FSMSnapshot, error) {
-	// Timer: SnapshotCreate (Raft Snapshot path)
 	var snapStart time.Time
 	if f.telemetry != nil {
 		snapStart = time.Now()

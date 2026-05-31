@@ -5,7 +5,6 @@ import (
 
 	"github.com/agberohq/dpx/engine/memory"
 	"github.com/agberohq/dpx/shared"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestNode_SingleNode_Propose(t *testing.T) {
@@ -26,10 +25,7 @@ func TestNode_SingleNode_Propose(t *testing.T) {
 			{Op: shared.OpSet, Key: []byte("hello"), Value: []byte("world")},
 		},
 	}
-	data, err := msgpack.Marshal(p)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
+	data := p.Marshal()
 
 	result, err := node.Propose(data)
 	if err != nil {
@@ -69,7 +65,7 @@ func TestNode_LeaderPropose(t *testing.T) {
 			{Op: shared.OpSet, Key: []byte("probe"), Value: []byte("ok")},
 		},
 	}
-	data, _ := msgpack.Marshal(p)
+	data := p.Marshal()
 	_, err = proposer.Propose(data)
 	if err != nil {
 		t.Errorf("Propose on embedded node: %v", err)
@@ -121,12 +117,8 @@ func TestNode_ConcurrentProposals(t *testing.T) {
 					{Op: shared.OpSet, Key: []byte{byte('a' + id)}, Value: []byte{byte(id)}},
 				},
 			}
-			data, err := msgpack.Marshal(p)
-			if err != nil {
-				errs <- err
-				return
-			}
-			_, err = node.Propose(data)
+			data := p.Marshal()
+			_, err := node.Propose(data)
 			errs <- err
 		}(i)
 	}
@@ -166,7 +158,7 @@ func TestNode_AppliedIndex(t *testing.T) {
 				{Op: shared.OpSet, Key: []byte{byte('a' + i)}, Value: []byte{1}},
 			},
 		}
-		data, _ := msgpack.Marshal(p)
+		data := p.Marshal()
 		node.Propose(data)
 	}
 

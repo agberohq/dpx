@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/agberohq/dpx/engine"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // shared helpers
@@ -554,9 +553,9 @@ func TestCheckpoint_ContainsAllKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read dump: %v", err)
 	}
-	var data map[string][]byte
-	if err := msgpack.Unmarshal(raw, &data); err != nil {
-		t.Fatalf("unmarshal dump: %v", err)
+	data, err2 := decodeDump(raw)
+	if err2 != nil {
+		t.Fatalf("decodeDump: %v", err2)
 	}
 	if string(data["key1"]) != "val1" {
 		t.Errorf("key1 = %q, want val1", data["key1"])

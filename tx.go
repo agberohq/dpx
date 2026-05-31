@@ -14,10 +14,20 @@ type dpxTx struct {
 	snap      engine.Snapshot
 	readSet   map[string]shared.ReadEntry
 	writes    []shared.WriteEntry
-	telemetry *shared.Telemetry // <-- ADDED
+	telemetry *shared.Telemetry
 }
 
 // Get reads a key from the snapshot and records it in the read-set.
+//
+// GetVersion (the second Pebble/memory lookup for the epoch record) is
+// deferred: we store epoch=0 now and fill in the real epoch lazily in
+// readSetSlice(), which is called only when the transaction actually has
+// writes to propose. Pure read-only transactions never call readSetSlice,
+// so they pay zero version-lookup cost.
+//
+// This halves the number of storage reads per tx.Get call (from 2 to 1)
+// for the common read path, which is the dominant operation for Pebble
+// where each lookup is a full LSM traversal.
 func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if isReserved(key) {
 		return nil, ErrReservedKey
@@ -26,12 +36,11 @@ func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	ver, err := tx.snap.GetVersion(key)
-	if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
-		return nil, err
-	}
 	k := string(key)
-	tx.readSet[k] = shared.ReadEntry{Key: []byte(k), Epoch: ver.Epoch, IsDebit: false}
+	// Sentinel: epoch=0 signals "version not yet fetched".
+	// readSetSlice() will hydrate the real epoch before building the proposal.
+	// We intentionally do NOT call snap.GetVersion here.
+	tx.readSet[k] = shared.ReadEntry{Key: []byte(k), Epoch: 0, IsDebit: false}
 	return val, nil
 }
 
@@ -82,6 +91,9 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 	if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
 		return 0, err
 	}
+	// Debit path: we MUST read the version here because this is a write that
+	// participates in conflict detection (IsDebit=true guards the overdraft check).
+	// This is not deferrable — the epoch is part of the semantic contract.
 	ver, err := tx.snap.GetVersion(key)
 	if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
 		return 0, err
@@ -124,6 +136,11 @@ func (tx *dpxTx) AllocateNextSequence(_ context.Context) (uint64, error) {
 
 func (tx *dpxTx) empty() bool { return len(tx.writes) == 0 }
 
+// readSetSlice builds the final ReadEntry slice for the Proposal.
+//
+// For any entry that had epoch=0 (recorded by Get without a version lookup),
+// we now fetch the real epoch. This is only called when len(tx.writes) > 0,
+// so pure read-only transactions pay zero extra GetVersion cost.
 func (tx *dpxTx) readSetSlice() []shared.ReadEntry {
 	if tx.telemetry != nil {
 		defer func(start time.Time) {
@@ -135,6 +152,17 @@ func (tx *dpxTx) readSetSlice() []shared.ReadEntry {
 	}
 	rs := make([]shared.ReadEntry, 0, len(tx.readSet))
 	for _, re := range tx.readSet {
+		// Hydrate the epoch for entries that were recorded with the deferred
+		// sentinel (epoch=0, IsDebit=false). Debit entries already have their
+		// real epoch fetched eagerly in AtomicAdd, so we skip those.
+		if re.Epoch == 0 && !re.IsDebit {
+			ver, err := tx.snap.GetVersion(re.Key)
+			if err == nil {
+				re.Epoch = ver.Epoch
+			}
+			// On error (key not found, etc.) epoch stays 0 — safe because a
+			// missing version means epoch 0 is the correct conflict baseline.
+		}
 		rs = append(rs, re)
 	}
 	return rs

@@ -10,7 +10,6 @@ import (
 	"github.com/agberohq/dpx/shared"
 	hraft "github.com/hashicorp/raft"
 	"github.com/olekukonko/hlc"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func setupFSM(t *testing.T) (*dpxFSM, *memory.Engine) {
@@ -38,11 +37,7 @@ func decode64(b []byte) int64 {
 
 func proposalBytes(t *testing.T, p *shared.Proposal) []byte {
 	t.Helper()
-	data, err := msgpack.Marshal(p)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	return data
+	return p.Marshal()
 }
 
 func TestFSM_Apply_SetAndGet(t *testing.T) {

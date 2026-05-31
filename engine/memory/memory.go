@@ -13,10 +13,9 @@ import (
 
 	"github.com/agberohq/dpx/engine"
 	"github.com/tidwall/btree"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
-const numShards = 32
+const numShards = 64
 const shardMask = numShards - 1
 
 func shardFor(key string) int {
@@ -56,7 +55,7 @@ type shardState struct {
 }
 
 // Engine is the in-memory StorageEngine.
-// Sharded mode partitions keys across 32 shards for parallel writes.
+// Sharded mode partitions keys across 64 shards for parallel writes.
 type Engine struct {
 	sharded   bool
 	shards    [numShards]shardState
@@ -100,19 +99,12 @@ func (e *Engine) Open() error {
 		}
 		return err
 	}
-	type dump struct {
-		Data    map[string][]byte
-		Applied uint64
-	}
-	var d dump
-	if err := msgpack.Unmarshal(b, &d); err != nil {
+	data, applied, err := decodeDump(b)
+	if err != nil {
 		return fmt.Errorf("memory engine: load dump: %w", err)
 	}
-	if d.Data == nil {
-		d.Data = make(map[string][]byte)
-	}
 	if e.sharded {
-		for k, v := range d.Data {
+		for k, v := range data {
 			s := shardFor(k)
 			st := e.shards[s].cur.Load()
 			next := st.clone()
@@ -121,11 +113,11 @@ func (e *Engine) Open() error {
 		}
 		for i := range e.shards {
 			st := e.shards[i].cur.Load()
-			e.shards[i].cur.Store(&state{tree: st.tree, applied: d.Applied})
+			e.shards[i].cur.Store(&state{tree: st.tree, applied: applied})
 		}
 	} else {
-		next := &state{tree: btree.NewBTreeG(itemLess), applied: d.Applied}
-		for k, v := range d.Data {
+		next := &state{tree: btree.NewBTreeG(itemLess), applied: applied}
+		for k, v := range data {
 			next.tree.Set(item{key: k, value: v})
 		}
 		e.cur.Store(next)
@@ -330,14 +322,7 @@ func (e *Engine) CreateCheckpoint(dir string) error {
 		})
 		applied = s.applied
 	}
-	type dump struct {
-		Data    map[string][]byte
-		Applied uint64
-	}
-	b, err := msgpack.Marshal(dump{Data: allData, Applied: applied})
-	if err != nil {
-		return err
-	}
+	b := encodeDump(allData, applied)
 	return os.WriteFile(filepath.Join(dir, "dump"), b, 0o600)
 }
 
