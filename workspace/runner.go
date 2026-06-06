@@ -53,7 +53,7 @@ type Compacter interface {
 	Compact() error
 }
 
-// ── RNG ──────────────────────────────────────────────────────────────────────
+// RNG
 
 type fastRNG struct{ x uint64 }
 
@@ -65,7 +65,7 @@ func (r *fastRNG) next() uint64 {
 }
 func (r *fastRNG) intn(n int) int { return int(r.next() % uint64(n)) }
 
-// ── Latency (per-goroutine, lock-free) ───────────────────────────────────────
+// Latency (per-goroutine, lock-free)
 
 type localSamples struct{ data []int64 }
 
@@ -112,7 +112,7 @@ func avg(s []int64) time.Duration {
 	return time.Duration(sum / int64(len(s)))
 }
 
-// ── Workloads ─────────────────────────────────────────────────────────────────
+// Workloads
 
 func workloadWrite(ctx context.Context, node *dpx.Node, keys [][]byte, valBuf []byte, rng *fastRNG) error {
 	k := keys[rng.intn(len(keys))]
@@ -154,7 +154,7 @@ func workloadMixed(ctx context.Context, node *dpx.Node, keys [][]byte, valBuf []
 	}
 }
 
-// ── Single timed run ──────────────────────────────────────────────────────────
+// Single timed run
 
 type runResult struct {
 	duration  time.Duration
@@ -255,7 +255,7 @@ func timedRunWithWorkerKeys(
 	}
 }
 
-// ── Multi-run aggregation ─────────────────────────────────────────────────────
+// Multi-run aggregation
 
 // runStats holds the aggregate across N timed runs.
 type runStats struct {
@@ -363,7 +363,7 @@ func (s *runStats) sortedLatencies() []int64 {
 	return cp
 }
 
-// ── Output ────────────────────────────────────────────────────────────────────
+// Output
 
 func repeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
@@ -468,7 +468,7 @@ func (s *runStats) printGoal() {
 	})
 }
 
-// ── Telemetry ─────────────────────────────────────────────────────────────────
+// Telemetry
 
 func printTelemetrySummary(t *shared.Telemetry, s *runStats) {
 	if t == nil {
@@ -583,7 +583,7 @@ func printMetrics(m *shared.Metrics) {
 	})
 }
 
-// ── Core run orchestration ────────────────────────────────────────────────────
+// Core run orchestration
 
 type runConfig struct {
 	engine      string
@@ -773,7 +773,7 @@ func getFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// main
 
 func main() {
 	flag.Parse()

@@ -11,20 +11,20 @@ import (
 // Wire format — zero-reflection binary codec for Proposal.
 //
 // Layout (little-endian throughout):
-//   [8] TimestampWall    uint64
-//   [2] TimestampCounter uint16
-//   [2] ReadSet length   uint16
+// TimestampWall    uint64
+// TimestampCounter uint16
+// ReadSet length   uint16
 //   for each ReadEntry:
-//     [2] key length     uint16
+// key length     uint16
 //     [N] key bytes
-//     [8] Epoch          uint64
-//     [1] IsDebit        uint8 (0 or 1)
-//   [2] Writes length    uint16
+// Epoch          uint64
+// IsDebit        uint8 (0 or 1)
+// Writes length    uint16
 //   for each WriteEntry:
-//     [1] Op             uint8
-//     [2] key length     uint16
+// Op             uint8
+// key length     uint16
 //     [N] key bytes
-//     [2] value length   uint16
+// value length   uint16
 //     [N] value bytes
 //
 // All length fields are uint16, capping individual keys/values at 65535 bytes

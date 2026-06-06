@@ -1,14 +1,13 @@
 package badger
 
-// dump.go — binary codec for badger engine checkpoints.
 // Matches the memory engine's wire format so checkpoints are interchangeable.
 //
 // Wire format (little-endian):
-//   [8]  entry count    uint64
+// entry count    uint64
 //   for each entry:
-//     [2]  key length   uint16
+// key length   uint16
 //     [N]  key bytes
-//     [4]  val length   uint32
+// val length   uint32
 //     [N]  val bytes
 //
 // Note: badger checkpoints don't carry an applied index (Pebble sequence

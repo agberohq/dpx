@@ -5,8 +5,8 @@ echo "🔨 Building runner..."
 go build -o dpx-bench ./runner.go
 
 DURATION="10s"
-KEYS=100000
-RUNS=3   # each scenario averaged across N timed runs; warmup fires once
+KEYS=1000000
+RUNS=5   # each scenario averaged across N timed runs; warmup fires once
 
 # ─── MEMORY (Global Lock) ────────────────────────────────────────────────────
 echo ""

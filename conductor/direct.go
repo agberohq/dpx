@@ -26,7 +26,7 @@ type proposalEntry struct {
 // Pipeline design:
 //
 //	applierLoop (goroutine 1)      writeLoop (goroutine 2)
-//	─────────────────────────      ──────────────────────
+
 //	Phase A: drain submitCh        Phase B: engine.ApplyBatch
 //	         conflict detect                notify callers
 //	         build engine batch             return pooled slices

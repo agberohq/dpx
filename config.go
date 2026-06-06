@@ -39,10 +39,23 @@ type RetryConfig struct {
 	Multiplier  float64
 }
 
+// Telemetry captures per-stage latency histograms. Alias of shared.Telemetry
+// so callers do not need to import internal/shared.
+type Telemetry = shared.Telemetry
+
 // Config is passed to dpx.Open. Engine is the only required field.
+// For most use cases, prefer OpenEmbedded / OpenSharded / OpenPebble which
+// set Engine automatically and require no internal package imports.
 type Config struct {
 	NodeID string
+
+	// Engine is the storage backend. Set automatically by OpenEmbedded,
+	// OpenSharded, and OpenPebble. Only set manually when using a custom engine.
 	Engine engine.StorageEngine
+
+	// DataDir is the data directory for disk-backed engines (Pebble, Badger).
+	// Used by OpenPebble. Ignored by OpenEmbedded / OpenSharded.
+	DataDir string
 
 	SyncPolicy SyncPolicy
 
@@ -57,7 +70,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 
 	Metrics   *Metrics
-	Telemetry *shared.Telemetry // nil = disabled; captures per-stage latency
+	Telemetry *Telemetry // nil = disabled; captures per-stage latency
 
 	// Logger is the parent application's logger (e.g. Teller's ll.Logger).
 	// Raft internals write to it. nil = discard.

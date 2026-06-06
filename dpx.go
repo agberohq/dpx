@@ -13,11 +13,31 @@ import (
 	"github.com/olekukonko/jack"
 )
 
+// KVPair is a key-value result from a range scan.
+// Identical in layout to engine.KVPair — exported here so callers never
+// need to import github.com/agberohq/dpx/engine.
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
+
+// IsNotFound reports whether err indicates a missing key.
+// Equivalent to errors.Is(err, dpx.ErrKeyNotFound).
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrKeyNotFound)
+}
+
+// IsConflict reports whether err is an OCC conflict that was not retried
+// (i.e. ErrConflictExhausted after all retry attempts were spent).
+func IsConflict(err error) bool {
+	return errors.Is(err, ErrConflict) || errors.Is(err, ErrConflictExhausted)
+}
+
 // KVStore is the public interface exposed by a DPX Node.
 type KVStore interface {
 	RunInTx(ctx context.Context, fn func(tx KVTx) error) error
-	GetRange(ctx context.Context, start, end []byte, limit int) ([]engine.KVPair, error)
-	GetRangeReverse(ctx context.Context, start, end []byte, limit int) ([]engine.KVPair, error)
+	GetRange(ctx context.Context, start, end []byte, limit int) ([]KVPair, error)
+	GetRangeReverse(ctx context.Context, start, end []byte, limit int) ([]KVPair, error)
 	WatchKey(ctx context.Context, prefix []byte) (<-chan struct{}, error)
 	GetDatabaseTime(ctx context.Context) (time.Time, error)
 	GetSafeReadPoint(ctx context.Context) (uint64, error)
@@ -30,7 +50,7 @@ type KVTx interface {
 	Set(ctx context.Context, key []byte, value []byte) error
 	Delete(ctx context.Context, key []byte) error
 	AtomicAdd(ctx context.Context, key []byte, delta int64) (int64, error)
-	GetRange(ctx context.Context, start, end []byte, limit int) ([]engine.KVPair, error)
+	GetRange(ctx context.Context, start, end []byte, limit int) ([]KVPair, error)
 	AllocateNextSequence(ctx context.Context) (uint64, error)
 }
 
@@ -263,7 +283,7 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 }
 
 // GetRange performs a forward range scan outside a transaction.
-func (n *Node) GetRange(_ context.Context, start, end []byte, limit int) ([]engine.KVPair, error) {
+func (n *Node) GetRange(_ context.Context, start, end []byte, limit int) ([]KVPair, error) {
 	if n.closed.Load() {
 		return nil, ErrStoreClosed
 	}
@@ -276,7 +296,7 @@ func (n *Node) GetRange(_ context.Context, start, end []byte, limit int) ([]engi
 }
 
 // GetRangeReverse performs a reverse range scan outside a transaction.
-func (n *Node) GetRangeReverse(_ context.Context, start, end []byte, limit int) ([]engine.KVPair, error) {
+func (n *Node) GetRangeReverse(_ context.Context, start, end []byte, limit int) ([]KVPair, error) {
 	if n.closed.Load() {
 		return nil, ErrStoreClosed
 	}

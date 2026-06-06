@@ -113,15 +113,15 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 }
 
 // GetRange scans keys in [start, end) within the snapshot.
-func (tx *dpxTx) GetRange(ctx context.Context, start, end []byte, limit int) ([]engine.KVPair, error) {
+func (tx *dpxTx) GetRange(ctx context.Context, start, end []byte, limit int) ([]KVPair, error) {
 	iter := tx.snap.NewIter(start, end)
 	defer iter.Close()
-	var pairs []engine.KVPair
+	var pairs []KVPair
 	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
 		if limit > 0 && len(pairs) >= limit {
 			break
 		}
-		pairs = append(pairs, engine.KVPair{
+		pairs = append(pairs, KVPair{
 			Key:   append([]byte(nil), iter.Key()...),
 			Value: append([]byte(nil), iter.Value()...),
 		})

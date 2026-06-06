@@ -1,15 +1,14 @@
 package memory
 
-// dump.go — zero-reflection binary codec for the memory engine's persistence
 // format. Replaces msgpack for the Open/CreateCheckpoint cold paths.
 //
 // Wire format (little-endian):
-//   [8]  applied index   uint64
-//   [8]  entry count     uint64
+// applied index   uint64
+// entry count     uint64
 //   for each entry:
-//     [2]  key length    uint16
+// key length    uint16
 //     [N]  key bytes
-//     [4]  val length    uint32
+// val length    uint32
 //     [N]  val bytes
 
 import (

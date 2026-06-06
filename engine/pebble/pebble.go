@@ -258,7 +258,7 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 	return &pebbleIter{iter: iter}
 }
 
-// ── Snapshots ────────────────────────────────────────────────────────────────
+// Snapshots
 
 // pebbleSharedSnapshot wraps the pooled shared snapshot.
 // Close() is a no-op — the snapshot lifecycle is managed by snapshotRefreshLoop.
@@ -371,7 +371,7 @@ func (s *pebbleSnapshot) NewIter(start, end []byte) engine.Iterator {
 func (s *pebbleSnapshot) Sequence() uint64 { return s.seq }
 func (s *pebbleSnapshot) Close() error     { return s.snap.Close() }
 
-// ── Iterators ────────────────────────────────────────────────────────────────
+// Iterators
 
 type pebbleIter struct{ iter *pebble.Iterator }
 
@@ -428,7 +428,7 @@ func (i *pebbleConsumerIter) Value() []byte { return append([]byte(nil), i.iter.
 func (i *pebbleConsumerIter) Error() error  { return i.iter.Error() }
 func (i *pebbleConsumerIter) Close() error  { return i.iter.Close() }
 
-// ── Batch ────────────────────────────────────────────────────────────────────
+// Batch
 
 type pebbleBatch struct{ b *pebble.Batch }
 
@@ -437,7 +437,7 @@ func (b *pebbleBatch) Delete(key []byte)       { b.b.Delete(key, nil) }
 func (b *pebbleBatch) Merge(key, value []byte) { b.b.Merge(key, value, nil) }
 func (b *pebbleBatch) Reset()                  { b.b.Reset() }
 
-// ── Int64Merger ──────────────────────────────────────────────────────────────
+// Int64Merger
 
 var Int64Merger = &pebble.Merger{
 	Name: "dpx.int64add",
@@ -467,7 +467,7 @@ func (m *int64Merger) Finish(_ bool) ([]byte, io.Closer, error) {
 	return b, nil, nil
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// Helpers
 
 func isReserved(key []byte) bool {
 	const prefix = "__dpx:"

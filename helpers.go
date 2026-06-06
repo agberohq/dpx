@@ -104,15 +104,15 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 // collectIter drains an Iterator into a []KVPair slice.
 // Reverse uses collect-then-reverse: correct for all Iterator implementations
 // regardless of Prev()-after-exhaustion behaviour.
-func collectIter(iter engine.Iterator, limit int, reverse bool) ([]engine.KVPair, error) {
+func collectIter(iter engine.Iterator, limit int, reverse bool) ([]KVPair, error) {
 	defer iter.Close()
 
-	var pairs []engine.KVPair
+	var pairs []KVPair
 	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
 		if limit > 0 && len(pairs) >= limit {
 			break
 		}
-		pairs = append(pairs, engine.KVPair{
+		pairs = append(pairs, KVPair{
 			Key:   append([]byte(nil), iter.Key()...),
 			Value: append([]byte(nil), iter.Value()...),
 		})
