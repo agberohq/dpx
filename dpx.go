@@ -66,6 +66,11 @@ type Node struct {
 	telemetry *shared.Telemetry
 	clock     *hlc.Clock
 	closed    atomic.Bool
+	// seqCounter is a node-level monotonic counter for AllocateNextSequence.
+	// It is independent of the engine's applied index so it works correctly
+	// on both the single-shard and sharded engines — the sharded engine
+	// has per-shard applied indices that are not globally monotonic.
+	seqCounter atomic.Uint64
 }
 
 // Open constructs and starts a DPX Node.
@@ -221,6 +226,7 @@ func (n *Node) runOnce(ctx context.Context, fn func(KVTx) error) error {
 		readSet:   make(map[string]shared.ReadEntry, 8),
 		writes:    make([]shared.WriteEntry, 0, 8),
 		telemetry: n.telemetry,
+		node:      n,
 	}
 
 	t1 := time.Now()
@@ -321,9 +327,13 @@ func (n *Node) GetDatabaseTime(_ context.Context) (time.Time, error) {
 	return n.clock.Now().Physical(), nil
 }
 
-// GetSafeReadPoint returns the last Raft log index applied to this node.
+// GetSafeReadPoint returns the safe sequence number for change feed consumption.
+// For embedded nodes this is the node-level sequence counter — the same counter
+// that AllocateNextSequence uses — which advances on every committed write.
+// engine.CurrentSequence() (the applied index) is not used here because the
+// sharded engine has per-shard applied indices that do not form a global sequence.
 func (n *Node) GetSafeReadPoint(_ context.Context) (uint64, error) {
-	return n.engine.CurrentSequence(), nil
+	return n.seqCounter.Load(), nil
 }
 
 // Backup writes a consistent engine checkpoint to destDir.

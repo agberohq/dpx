@@ -624,11 +624,29 @@ func (s *shardedSnapshot) NewIter(start, end []byte) engine.Iterator {
 		s.telemetry.RecordIterMaterialise(time.Since(matStart))
 	}
 
+	// Sort by key so forward and reverse iteration are globally ordered.
+	// Each shard's btree is internally sorted but concatenation across
+	// 64 shards loses global order — a single sort here restores it.
+	sort.Slice(all, func(i, j int) bool {
+		return string(all[i][0]) < string(all[j][0])
+	})
+
 	return &memIter{pairs: all, pos: -1}
 }
 
-func (s *shardedSnapshot) Sequence() uint64 { return 0 } // aggregated across shards
-func (s *shardedSnapshot) Close() error     { return nil }
+// Sequence returns the maximum applied index across all shards.
+// This matches CurrentSequence() semantics and ensures AllocateNextSequence
+// returns a strictly increasing value as writes commit.
+func (s *shardedSnapshot) Sequence() uint64 {
+	var max uint64
+	for _, st := range s.states {
+		if st.applied > max {
+			max = st.applied
+		}
+	}
+	return max
+}
+func (s *shardedSnapshot) Close() error { return nil }
 
 // Iterator
 

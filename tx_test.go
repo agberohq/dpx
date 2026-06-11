@@ -201,7 +201,7 @@ func TestTx_Get_MissingKeyNotInReadSet(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := tx.Get(ctx, []byte("missing"))
-	if err != engine.ErrKeyNotFound {
+	if err != ErrKeyNotFound {
 		t.Errorf("got %v, want ErrKeyNotFound", err)
 	}
 	if _, ok := tx.readSet["missing"]; ok {

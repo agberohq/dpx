@@ -922,3 +922,220 @@ func BenchmarkEngine_ConcurrentTransfer(b *testing.B) {
 		}
 	})
 }
+
+// Sharded engine tests
+//
+// The sharded engine (NewSharded) uses a separate code path: shardedSnapshot
+// aggregates state across 64 independent btree shards. These tests confirm
+// that the sharded snapshot satisfies the same contracts as the non-sharded
+// snapshot — specifically iterator ordering and Sequence().
+//
+// Tests are deliberately narrow: each targets one observable behaviour so
+// a regression in the fix is immediately localised.
+
+// TestSharded_NewIter_GlobalOrder verifies that GetRange results across
+// multiple shards are returned in ascending lexicographic order.
+// The keys "rng:00"–"rng:04" are distributed across different shards by
+// FNV hash, so without an explicit sort the iterator returns them in shard
+// order rather than key order.
+func TestSharded_NewIter_GlobalOrder(t *testing.T) {
+	e := NewSharded()
+	if err := e.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	// Write 5 keys in one batch — they route to different shards.
+	b := e.NewBatch()
+	for i := 0; i < 5; i++ {
+		key := []byte("rng:" + string(rune('0'+i/10)) + string(rune('0'+i%10)))
+		b.Set(key, le64(int64(i)))
+	}
+	if err := e.ApplyBatch(b, engine.WriteOptions{}); err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+
+	snap, err := e.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	defer snap.Close()
+
+	iter := snap.NewIter([]byte("rng:"), []byte("rng:~"))
+	defer iter.Close()
+
+	var got []string
+	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+		got = append(got, string(iter.Key()))
+	}
+
+	if len(got) != 5 {
+		t.Fatalf("got %d keys, want 5: %v", len(got), got)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Errorf("keys not sorted at position %d: %q <= %q\nfull result: %v",
+				i, got[i], got[i-1], got)
+		}
+	}
+	if got[0] != "rng:00" {
+		t.Errorf("first key = %q, want rng:00\nfull result: %v", got[0], got)
+	}
+}
+
+// TestSharded_NewIter_ReverseOrder verifies that after forward exhaustion
+// the iterator walks back in descending lexicographic order.
+func TestSharded_NewIter_ReverseOrder(t *testing.T) {
+	e := NewSharded()
+	if err := e.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	b := e.NewBatch()
+	for _, k := range []string{"rev:a", "rev:b", "rev:c"} {
+		b.Set([]byte(k), []byte(k))
+	}
+	if err := e.ApplyBatch(b, engine.WriteOptions{}); err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+
+	snap, err := e.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	defer snap.Close()
+
+	iter := snap.NewIter([]byte("rev:"), []byte("rev:~"))
+	defer iter.Close()
+
+	// Exhaust forward.
+	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+	}
+
+	var got []string
+	for iter.Prev(); iter.Valid(); iter.Prev() {
+		got = append(got, string(iter.Key()))
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("reverse scan got %v, want 3 keys", got)
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] >= got[i-1] {
+			t.Errorf("keys not reverse-sorted at position %d: %q >= %q\nfull result: %v",
+				i, got[i], got[i-1], got)
+		}
+	}
+}
+
+// TestSharded_Sequence_AdvancesAfterWrite verifies that shardedSnapshot.Sequence()
+// returns the maximum applied index across all shards — not a hardcoded 0.
+// Without the fix, AllocateNextSequence always returns 1 regardless of commits.
+func TestSharded_Sequence_AdvancesAfterWrite(t *testing.T) {
+	e := NewSharded()
+	if err := e.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	// Before any write, sequence is 0.
+	snap0, _ := e.GetSnapshot()
+	if snap0.Sequence() != 0 {
+		t.Errorf("fresh sharded sequence = %d, want 0", snap0.Sequence())
+	}
+	snap0.Close()
+
+	// Commit a write that includes __dpx:applied so applied advances.
+	applied := uint64(7)
+	b := e.NewBatch()
+	b.Set([]byte("k"), []byte("v"))
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, applied)
+	b.Set([]byte("__dpx:applied"), buf)
+	if err := e.ApplyBatch(b, engine.WriteOptions{}); err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+
+	snap1, err := e.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	defer snap1.Close()
+
+	if snap1.Sequence() == 0 {
+		t.Error("sharded Sequence() = 0 after write — hardcoded zero not fixed")
+	}
+	if snap1.Sequence() != applied {
+		t.Errorf("sharded Sequence() = %d, want %d", snap1.Sequence(), applied)
+	}
+}
+
+// TestSharded_Sequence_StrictlyIncreasing verifies that successive writes
+// produce strictly increasing Sequence() values — the AllocateNextSequence
+// contract depends on this.
+func TestSharded_Sequence_StrictlyIncreasing(t *testing.T) {
+	e := NewSharded()
+	if err := e.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	var prev uint64
+	for i := 1; i <= 5; i++ {
+		applied := uint64(i * 10)
+		b := e.NewBatch()
+		b.Set([]byte("k"), []byte("v"))
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, applied)
+		b.Set([]byte("__dpx:applied"), buf)
+		e.ApplyBatch(b, engine.WriteOptions{})
+
+		snap, err := e.GetSnapshot()
+		if err != nil {
+			t.Fatalf("GetSnapshot[%d]: %v", i, err)
+		}
+		seq := snap.Sequence()
+		snap.Close()
+
+		if seq <= prev {
+			t.Errorf("seq[%d]=%d not > seq[%d]=%d", i, seq, i-1, prev)
+		}
+		prev = seq
+	}
+}
+
+// TestSharded_NewIter_ExcludesReservedKeys verifies that __dpx: prefixed
+// keys are filtered from the sharded consumer iterator, matching the
+// non-sharded engine behaviour.
+func TestSharded_NewIter_ExcludesReservedKeys(t *testing.T) {
+	e := NewSharded()
+	if err := e.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer e.Close()
+
+	b := e.NewBatch()
+	b.Set([]byte("user:1"), []byte("v"))
+	b.Set([]byte("__dpx:ver:user:1"), epochRecord(1, false))
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, 1)
+	b.Set([]byte("__dpx:applied"), buf)
+	e.ApplyBatch(b, engine.WriteOptions{})
+
+	snap, err := e.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	defer snap.Close()
+
+	iter := snap.NewIter([]byte("\x00"), []byte("\xFF"))
+	defer iter.Close()
+
+	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+		k := string(iter.Key())
+		if len(k) >= 6 && k[:6] == "__dpx:" {
+			t.Errorf("sharded consumer iter exposed reserved key: %q", k)
+		}
+	}
+}

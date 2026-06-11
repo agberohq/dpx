@@ -15,6 +15,7 @@ type dpxTx struct {
 	readSet   map[string]shared.ReadEntry
 	writes    []shared.WriteEntry
 	telemetry *shared.Telemetry
+	node      *Node // for AllocateNextSequence counter; nil in tests using fakeSnapshot
 }
 
 // Get reads a key from the snapshot and records it in the read-set.
@@ -34,6 +35,11 @@ func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	}
 	val, err := tx.snap.Get(key)
 	if err != nil {
+		// Translate the engine-level sentinel to the dpx-level sentinel so
+		// callers can use dpx.IsNotFound without importing engine.
+		if err == engine.ErrKeyNotFound {
+			return nil, ErrKeyNotFound
+		}
 		return nil, err
 	}
 	k := string(key)
@@ -129,8 +135,15 @@ func (tx *dpxTx) GetRange(ctx context.Context, start, end []byte, limit int) ([]
 	return pairs, iter.Error()
 }
 
-// AllocateNextSequence returns snap.Sequence() + 1.
+// AllocateNextSequence returns a strictly monotonic sequence number.
+// It uses a node-level atomic counter so the sequence is globally monotonic
+// across all shards — the sharded engine has per-shard applied indices that
+// are not globally monotonic and cannot be used for this purpose.
 func (tx *dpxTx) AllocateNextSequence(_ context.Context) (uint64, error) {
+	if tx.node != nil {
+		return tx.node.seqCounter.Add(1), nil
+	}
+	// Fallback for tests that construct dpxTx directly without a Node.
 	return tx.snap.Sequence() + 1, nil
 }
 
