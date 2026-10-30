@@ -19,6 +19,38 @@ func openMemNode(t testing.TB) *dpx.Node {
 	return n
 }
 
+func openShardedNode(t testing.TB) *dpx.Node {
+	t.Helper()
+	n, err := dpx.Open(dpx.Config{Engine: memory.NewSharded(), RaftDir: t.TempDir()}, dpxraft.Open)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+	return n
+}
+
+func openMemNodeWithMetrics(t testing.TB) *dpx.Node {
+	t.Helper()
+	m := &dpx.Metrics{}
+	n, err := dpx.Open(dpx.Config{Engine: memory.New(), RaftDir: t.TempDir(), Metrics: m}, dpxraft.Open)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+	return n
+}
+
+func openPebbleNode(t testing.TB) *dpx.Node {
+	t.Helper()
+	dir := t.TempDir()
+	n, err := dpx.OpenPebble(dpx.Config{DataDir: dir})
+	if err != nil {
+		t.Fatalf("OpenPebble: %v", err)
+	}
+	t.Cleanup(func() { n.Close() })
+	return n
+}
+
 func TestSetGet(t *testing.T) {
 	n := openMemNode(t)
 	ctx := context.Background()
