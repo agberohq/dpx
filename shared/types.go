@@ -80,6 +80,9 @@ type Metrics struct {
 	SnapshotRecoverTotal atomic.Uint64
 	BackupTotal          atomic.Uint64
 
+	// TransactionsTotal counts all successful RunInTx calls.
+	TransactionsTotal atomic.Uint64
+
 	ApplyDurationNs           atomic.Int64
 	RaftCommitDurationNs      atomic.Int64
 	KeyEpochRebuildDurationNs atomic.Int64

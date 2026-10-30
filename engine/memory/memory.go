@@ -171,6 +171,69 @@ func (e *Engine) NewBatch() engine.Batch {
 	return &memBatch{}
 }
 
+// ApplyShardDirect applies writes directly to a specific shard's btree.
+// The caller must hold the shard's CAS lock (not the engine's mutex).
+// This is the fast path used by the sharded proposer's applyInline.
+func (e *Engine) ApplyShardDirect(shardIdx int, writes []WriteOp, applied uint64) {
+	sh := &e.shards[shardIdx]
+	sh.mu.Lock()
+	cur := sh.cur.Load()
+	next := cur.clone()
+	for _, w := range writes {
+		switch w.Op {
+		case 's':
+			next.tree.Set(item{key: w.Key, value: w.Value})
+			if w.Key == "__dpx:applied" && len(w.Value) >= 8 {
+				next.applied = binary.LittleEndian.Uint64(w.Value)
+			}
+		case 'd':
+			next.tree.Delete(item{key: w.Key})
+		case 'm':
+			old, _ := next.tree.Get(item{key: w.Key})
+			next.tree.Set(item{key: w.Key, value: encodeInt64(decodeInt64(old.value) + decodeInt64(w.Value))})
+		}
+	}
+	sh.cur.Store(next)
+	sh.mu.Unlock()
+}
+
+// WriteOp is a single write operation for ApplyShardDirect.
+type WriteOp struct {
+	Op    byte
+	Key   string
+	Value []byte
+}
+
+// ShardStateDirect provides direct access to a shard's state for the sharded proposer.
+type ShardStateDirect struct {
+	mu  sync.Mutex
+	cur atomic.Pointer[state]
+}
+
+// ApplyDirect applies writes directly to this shard's btree with COW clone.
+// The caller must hold the CAS lock (not the mutex).
+func (ss *ShardStateDirect) ApplyDirect(writes []WriteOp, applied uint64) {
+	ss.mu.Lock()
+	cur := ss.cur.Load()
+	next := cur.clone()
+	for _, w := range writes {
+		switch w.Op {
+		case 's':
+			next.tree.Set(item{key: w.Key, value: w.Value})
+			if w.Key == "__dpx:applied" && len(w.Value) >= 8 {
+				next.applied = binary.LittleEndian.Uint64(w.Value)
+			}
+		case 'd':
+			next.tree.Delete(item{key: w.Key})
+		case 'm':
+			old, _ := next.tree.Get(item{key: w.Key})
+			next.tree.Set(item{key: w.Key, value: encodeInt64(decodeInt64(old.value) + decodeInt64(w.Value))})
+		}
+	}
+	ss.cur.Store(next)
+	ss.mu.Unlock()
+}
+
 func (e *Engine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
 	if e.sharded {
 		return e.applyBatchSharded(b)

@@ -21,6 +21,15 @@ type proposalEntry struct {
 	accStart time.Time
 }
 
+// entryPool recycles proposalEntry objects to reduce GC pressure.
+var entryPool = sync.Pool{
+	New: func() any {
+		return &proposalEntry{
+			resultCh: make(chan shared.ApplyResult, 1),
+		}
+	},
+}
+
 // directProposer bypasses HashiCorp Raft for single-node embedded mode.
 //
 // Pipeline design:
@@ -55,16 +64,9 @@ const (
 	maxBatchSize = 2048
 
 	// defaultFlushInterval is used by the non-sharded single proposer.
-	// At 512 goroutines / 1 shard, the drain loop fills batches naturally
-	// and the ticker fires as a backstop for quiet periods.
-	defaultFlushInterval = 1 * time.Millisecond
-
-	// shardedFlushInterval is used by each shard in the sharded proposer.
-	// With 8192 goroutines / 64 shards = 128 goroutines/shard and a ~9ms
-	// round-trip, Little's Law gives ~1152 ops/shard/flush window. Raising
-	// the interval lets the drain loop accumulate larger batches before the
-	// ticker fires, recovering the batch-size collapse seen at 1ms.
-	shardedFlushInterval = 2 * time.Millisecond
+	// Reduced from 1ms to 250µs to lower latency for the single-shard path.
+	// The drain loop still fills batches naturally at high concurrency.
+	defaultFlushInterval = 250 * time.Microsecond
 )
 
 const maxStackShadow = 64
@@ -82,6 +84,29 @@ func newDirectProposer(
 	telemetry *shared.Telemetry,
 ) (*directProposer, error) {
 	return newDirectProposerWithInterval(eng, syncPolicy, w, metrics, telemetry, defaultFlushInterval)
+}
+
+// newDirectProposerNoLoop creates a directProposer without starting an
+// applierLoop goroutine. Used by shardedDirectProposer where ProposeDirect
+// calls ApplyOneDirect directly — the loop goroutine would just waste a
+// thread sleeping on a ticker that nobody ever triggers via submitCh.
+func newDirectProposerNoLoop(
+	eng engine.StorageEngine,
+	syncPolicy shared.SyncPolicy,
+	w shared.WatchNotifier,
+	metrics *shared.Metrics,
+) (*directProposer, error) {
+	clock := hlc.NewClock()
+	f := newFSM(eng, syncPolicy, w, metrics, clock)
+	f.skipHLC = true
+	if _, err := f.open(nil); err != nil {
+		return nil, err
+	}
+	return &directProposer{
+		fsm:      f,
+		submitCh: make(chan *proposalEntry, 1), // minimal; never drained
+		done:     make(chan struct{}),
+	}, nil
 }
 
 func newDirectProposerWithInterval(
@@ -123,10 +148,8 @@ func (d *directProposer) ProposeDirect(p *shared.Proposal) (shared.ApplyResult, 
 	}
 
 	var t0 time.Time
-	entry := &proposalEntry{
-		p:        p,
-		resultCh: make(chan shared.ApplyResult, 1),
-	}
+	entry := entryPool.Get().(*proposalEntry)
+	entry.p = p
 	if d.fsm.telemetry != nil {
 		t0 = time.Now()
 		entry.accStart = t0
@@ -138,6 +161,8 @@ func (d *directProposer) ProposeDirect(p *shared.Proposal) (shared.ApplyResult, 
 			d.fsm.telemetry.DirectSubmit.Record(time.Since(t0))
 		}
 	case <-d.done:
+		entry.p = nil
+		entryPool.Put(entry)
 		return shared.ApplyResult{}, errDirectClosed
 	}
 
@@ -146,8 +171,14 @@ func (d *directProposer) ProposeDirect(p *shared.Proposal) (shared.ApplyResult, 
 		if d.fsm.telemetry != nil {
 			d.fsm.telemetry.DirectRoundTrip.Record(time.Since(t0))
 		}
+		// Do NOT reset entry.p here — applyBatchDirect may still be
+		// reading entry.p.Writes for watcher notifications.
+		// The entry is returned to the pool by applyBatchDirect after
+		// all references are released.
 		return res, nil
 	case <-d.done:
+		entry.p = nil
+		entryPool.Put(entry)
 		return shared.ApplyResult{}, errDirectClosed
 	}
 }
@@ -230,6 +261,16 @@ func (d *directProposer) applierLoop() {
 // allocation, no sync.Pool get/put, no writeCh send/receive, no goroutine
 // wake-up. This is the original v1 applyBatch behaviour, recovered for the
 // non-sharded engine where the phase-A/phase-B pipeline buys nothing.
+// ApplyOneDirect applies a single proposal synchronously without going
+// through the submit channel or applierLoop.
+// Used by shardedDirectProposer when direct apply is needed.
+func (d *directProposer) ApplyOneDirect(p *shared.Proposal) shared.ApplyResult {
+	resultCh := make(chan shared.ApplyResult, 1)
+	entry := &proposalEntry{p: p, resultCh: resultCh}
+	d.applyBatchDirect([]*proposalEntry{entry})
+	return <-resultCh
+}
+
 func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 	engBatch := d.fsm.engine.NewBatch()
 	results := make([]shared.ApplyResult, len(entries))
@@ -361,6 +402,12 @@ func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 			d.fsm.watchers.NotifyBatch(entry.p.Writes, d.fsm.metrics)
 		}
 		entry.resultCh <- results[i]
+		// Return entry to pool AFTER all references to entry.p are released.
+		// ProposeDirect waits on entry.resultCh, so it won't reuse the entry
+		// until this send completes. Then we reset and pool it.
+		entry.p = nil
+		entry.accStart = time.Time{}
+		entryPool.Put(entry)
 	}
 }
 
