@@ -15,7 +15,7 @@ import (
 	"github.com/tidwall/btree"
 )
 
-const numShards = 64
+const numShards = 128
 const shardMask = numShards - 1
 
 func shardFor(key string) int {

@@ -410,7 +410,7 @@ func TestMVCC_CompactionReclaimsMemory(t *testing.T) {
 	// Count versions before compaction
 	shard := e.shards[shardFor("key")]
 	shard.mu.RLock()
-	versionsBefore := len(shard.data["key"])
+	versionsBefore := len(shard.data["key"].Load())
 	shard.mu.RUnlock()
 
 	if versionsBefore < 10 {
@@ -422,7 +422,7 @@ func TestMVCC_CompactionReclaimsMemory(t *testing.T) {
 
 	// Count versions after compaction
 	shard.mu.RLock()
-	versionsAfter := len(shard.data["key"])
+	versionsAfter := len(shard.data["key"].Load())
 	shard.mu.RUnlock()
 
 	if versionsAfter >= versionsBefore {

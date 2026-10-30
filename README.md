@@ -70,20 +70,20 @@ Single-process, single-shard. Best for testing and low-concurrency workloads.
 node, _ := dpx.OpenEmbedded(dpx.Config{})
 ```
 
-### Sharded (64 Shards, B-tree)
+### Sharded (128 Shards, B-tree)
 
-Single-process, 64 independent shards using a copy-on-write B-tree. Each shard has its own conflict detection and apply path.
+Single-process, 128 independent shards using a copy-on-write B-tree. Each shard has its own conflict detection and apply path.
 
 ```go
 node, _ := dpx.OpenSharded(dpx.Config{})
 ```
 
-### MVCC Sharded (64 Shards, Hash Map) — Recommended
+### MVCC Sharded (128 Shards, Hash Map) — Recommended
 
-Single-process, 64 independent shards using MVCC (Multi-Version Concurrency Control) with hash map storage. **Recommended for Teller production.**
+Single-process, 128 independent shards using MVCC (Multi-Version Concurrency Control) with hash map storage. **Recommended for Teller production.**
 
 **Key advantages over B-tree sharded:**
-- **4x faster**: ~670k TPS vs ~170k TPS
+- **6x faster**: ~1.06M TPS vs ~170k TPS
 - **Atomic commit protocol**: All keys in a batch share one commit sequence, so snapshots never see partial transactions
 - **O(1) snapshots**: No COW tree cloning — just read a sequence counter
 - **Automatic compaction**: Background goroutine reclaims old versions while respecting active snapshots
@@ -200,11 +200,11 @@ fmt.Printf("Transactions: %d, Conflicts: %d\n",
 
 | Engine | TPS | Latency (mean) | Latency (p99) | vs Target |
 |--------|-----|---------------|---------------|-----------|
-| MVCC Sharded | ~960k | 2.1ms | 35ms | 1.6x slower |
+| MVCC Sharded | ~1.06M | 1.9ms | 49ms | 1.4x slower |
 | B-tree Sharded | ~170k | 12ms | 92ms | 9.2x slower |
 | Target (Teller) | 1.5M | — | — | — |
 
-For 200M transactions/day (~2,300 TPS sustained), both sharded modes exceed requirements by 70-400x. For burst workloads (500k-1.5M TPS), MVCC sharded is the recommended engine.
+For 200M transactions/day (~2,300 TPS sustained), both sharded modes exceed requirements by 70-460x. For burst workloads (500k-1.5M TPS), MVCC sharded is the recommended engine.
 
 Key optimizations:
 
@@ -216,6 +216,9 @@ Key optimizations:
 - **250µs flush interval**: Minimal batch accumulation delay
 - **MVCC atomic commits**: All keys in a batch share one sequence, eliminating partial visibility
 - **MVCC auto-compaction**: Background goroutine reclaims old versions safely
+- **128 shards**: Reduced per-shard contention (16 goroutines/shard vs 32)
+- **CAS spinlock backoff**: Tight spin for first 4 attempts, then yield
+- **Lock-free entry reads**: Atomic pointer swaps per key, no RWMutex for snapshot reads
 
 ### Performance bottleneck analysis
 
@@ -223,15 +226,15 @@ CPU profiling reveals the remaining bottleneck preventing 1.5M TPS:
 
 | Component | CPU % | Description |
 |-----------|-------|-------------|
-| `pthread_cond_wait` | 28% | RWMutex slow path — reader-writer exclusion between snapshots and writes |
-| `pthread_cond_signal` | 13% | RWMutex unlock signaling |
-| `usleep` | 10% | CAS spinlock yield in `applyInline` |
-| `madvise` | 8% | Memory allocation |
-| `lockSlow` | 19% (cumulative) | RWMutex contention in MVCC shard |
+| `pthread_cond_wait` | 23% | Mutex slow path — map add/delete in `ApplyShardDirect` and `Compact` |
+| `pthread_cond_signal` | 11% | Mutex unlock signaling |
+| `usleep` | 8% | CAS spinlock yield in `applyInline` |
+| `madvise` | 9% | Memory allocation |
+| `lockSlow` | 14% (cumulative) | Mutex contention in MVCC shard |
 
-The `keyEpoch` map is already per-shard (64 independent FSMs), so there is no shared epoch contention. The RWMutex per shard is needed for reader-writer exclusion: snapshots (readers) must not see partially-written data during `ApplyShardDirect` (writers). Since the CAS spinlock already serializes writers, the RWMutex only contends with readers, not other writers.
+The `keyEpoch` map is already per-shard (128 independent FSMs), so there is no shared epoch contention. Entry slice reads use atomic pointer swaps (`atomicValue`) and never block. The shard's data map requires a mutex for add/delete operations (new keys, compaction cleanup), because Go doesn't allow concurrent map iteration and write. The mutex is held briefly — just long enough to process all writes and store new slice pointers.
 
-An atomic pointer swap (COW map) approach was tested but proved too expensive: copying a 100K-key map on every write reduced throughput from 1.19M to 6.9K TPS. The RWMutex remains the correct choice for this workload.
+With 128 shards and 2048 goroutines, each shard sees ~16 goroutines instead of 32, reducing CAS spinlock wait time by ~2x. The CAS spinlock uses tight spin for the first 4 attempts before yielding, reducing `usleep` overhead.
 
 ## Relationship with Teller
 

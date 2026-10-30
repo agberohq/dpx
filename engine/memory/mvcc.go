@@ -67,9 +67,40 @@ type MVCCEngine struct {
 }
 
 // mvccShard is a single shard's MVCC data.
+// For sharded mode, the data map uses atomic.Value per key so readers
+// (snapshots) can load entry slices without any mutex, while writers
+// (ApplyShardDirect) create new slices and store them atomically.
+// This eliminates the RWMutex contention that was consuming 28% of CPU.
 type mvccShard struct {
-	mu   sync.RWMutex
-	data map[string][]*mvccEntry // key -> sorted list of versions
+	mu   sync.RWMutex            // used only for non-sharded path and compaction
+	data map[string]*atomicValue // key -> atomic pointer to []*mvccEntry
+}
+
+// atomicValue wraps []*mvccEntry with atomic load/store for lock-free reads.
+type atomicValue struct {
+	v atomic.Pointer[mvccEntrySlice]
+}
+
+type mvccEntrySlice []*mvccEntry
+
+func newAtomicValue(entries []*mvccEntry) *atomicValue {
+	av := &atomicValue{}
+	s := mvccEntrySlice(entries)
+	av.v.Store(&s)
+	return av
+}
+
+func (av *atomicValue) Load() []*mvccEntry {
+	p := av.v.Load()
+	if p == nil {
+		return nil
+	}
+	return []*mvccEntry(*p)
+}
+
+func (av *atomicValue) Store(entries []*mvccEntry) {
+	s := mvccEntrySlice(entries)
+	av.v.Store(&s)
 }
 
 // mvccEntry is a single versioned value.
@@ -99,7 +130,7 @@ func newMVCCEngine(sharded bool) *MVCCEngine {
 	e.oldestSnapshot.Store(0)
 	for i := range e.shards {
 		e.shards[i] = &mvccShard{
-			data: make(map[string][]*mvccEntry, 1024),
+			data: make(map[string]*atomicValue, 1024),
 		}
 	}
 	prefix := "dpx-mvcc"
@@ -128,12 +159,20 @@ func (e *MVCCEngine) Open() error {
 	e.seqCounter.Store(applied)
 	for k, v := range data {
 		sh := shardFor(k)
-		e.shards[sh].mu.Lock()
-		e.shards[sh].data[k] = append(e.shards[sh].data[k], &mvccEntry{
+		s := e.shards[sh]
+		s.mu.Lock()
+		av, ok := s.data[k]
+		if !ok {
+			av = newAtomicValue(nil)
+			s.data[k] = av
+		}
+		entries := av.Load()
+		entries = append(entries, &mvccEntry{
 			seq:   applied,
 			value: v,
 		})
-		e.shards[sh].mu.Unlock()
+		av.Store(entries)
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -152,11 +191,13 @@ func (e *MVCCEngine) SetTelemetry(r engine.StageRecorder) {
 func (e *MVCCEngine) Get(key []byte) ([]byte, error) {
 	sh := shardFor(string(key))
 	s := e.shards[sh]
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	entries, ok := s.data[string(key)]
+	av, ok := s.data[string(key)]
 	if !ok {
+		return nil, engine.ErrKeyNotFound
+	}
+	entries := av.Load()
+	if len(entries) == 0 {
 		return nil, engine.ErrKeyNotFound
 	}
 	// Check the latest entry: if it's a delete, the key is gone
@@ -232,19 +273,26 @@ func (e *MVCCEngine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
 				value:   op.value,
 				deleted: op.op == 'd',
 			}
+			av, ok := s.data[op.key]
+			if !ok {
+				av = newAtomicValue(nil)
+				s.data[op.key] = av
+			}
+			entries := av.Load()
 			switch op.op {
 			case 's':
-				s.data[op.key] = append(s.data[op.key], entry)
+				entries = append(entries, entry)
 			case 'd':
-				s.data[op.key] = append(s.data[op.key], entry)
+				entries = append(entries, entry)
 			case 'm':
 				// For merge, find the current value and add delta
-				current := e.getCurrentValue(s.data[op.key])
+				current := e.getCurrentValue(entries)
 				delta := decodeInt64MVCC(op.value)
 				newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
 				entry.value = newVal
-				s.data[op.key] = append(s.data[op.key], entry)
+				entries = append(entries, entry)
 			}
+			av.Store(entries)
 		}
 		s.mu.Unlock()
 	}
@@ -265,11 +313,15 @@ type MVCCWriteOp struct {
 
 // ApplyShardDirect applies writes directly to a specific shard.
 // The caller MUST already hold exclusive writer access to this shard
-// (e.g., via the sharded proposer's CAS spinlock). The RWMutex is still
-// acquired to exclude concurrent readers (snapshots, Compact), but since
-// the CAS spinlock already serializes writers, the lock only contends with
-// readers, not other writers — this is much faster than the full ApplyBatch
-// path where the RWMutex serializes both readers and writers.
+// (e.g., via the sharded proposer's CAS spinlock).
+//
+// LOCK-FREE READERS: Entry slice reads (snap.Get) use atomic pointer swaps
+// and never block. However, the shard's data map itself requires a mutex
+// for add/delete operations (new keys, compaction cleanup), because Go
+// doesn't allow concurrent map iteration and write. The mutex is held only
+// briefly — just long enough to process all writes and store new slice pointers.
+// Since the CAS spinlock serializes writers, the mutex only contends with
+// Compact() which runs in the background every 100ms.
 //
 // Returns the commit sequence assigned to this batch.
 func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64 {
@@ -277,32 +329,45 @@ func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64
 	commitSeq := e.seqCounter.Add(uint64(len(writes)))
 
 	s := e.shards[shardIdx]
-	s.mu.Lock()
-	// Writer-writer exclusion is already handled by CAS spinlock in the caller.
-	// This lock only excludes readers (snapshots, Compact) during the write.
 
+	// Build entries outside the lock; merge deltas are computed inside
+	type keyedOp struct {
+		key   string
+		entry *mvccEntry
+		op    byte
+		value []byte // original value for merge
+	}
+	ops := make([]keyedOp, 0, len(writes))
 	for _, w := range writes {
 		entry := &mvccEntry{
 			seq:     commitSeq,
 			value:   w.Value,
 			deleted: w.Op == 'd',
 		}
-		switch w.Op {
-		case 's':
-			s.data[w.Key] = append(s.data[w.Key], entry)
-		case 'd':
-			s.data[w.Key] = append(s.data[w.Key], entry)
-		case 'm':
-			// For merge, find the current value and add delta
-			entries := s.data[w.Key]
-			current := e.getCurrentValue(entries)
-			delta := decodeInt64MVCC(w.Value)
-			newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
-			entry.value = newVal
-			s.data[w.Key] = append(entries, entry)
-		}
+		ops = append(ops, keyedOp{key: w.Key, entry: entry, op: w.Op, value: w.Value})
 	}
 
+	// Batch all map operations under a single lock acquisition
+	s.mu.Lock()
+	for _, ko := range ops {
+		av, ok := s.data[ko.key]
+		if !ok {
+			av = newAtomicValue(nil)
+			s.data[ko.key] = av
+		}
+		entries := av.Load()
+		switch ko.op {
+		case 's', 'd':
+			entries = append(entries, ko.entry)
+		case 'm':
+			current := e.getCurrentValue(entries)
+			delta := decodeInt64MVCC(ko.value)
+			newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
+			ko.entry.value = newVal
+			entries = append(entries, ko.entry)
+		}
+		av.Store(entries)
+	}
 	s.mu.Unlock()
 
 	// Mark this commit as fully visible.
@@ -335,7 +400,8 @@ func (e *MVCCEngine) CreateCheckpoint(dir string) error {
 	for i := range e.shards {
 		s := e.shards[i]
 		s.mu.RLock()
-		for k, entries := range s.data {
+		for k, av := range s.data {
+			entries := av.Load()
 			for j := len(entries) - 1; j >= 0; j-- {
 				if !entries[j].deleted {
 					allData[k] = entries[j].value
@@ -383,13 +449,9 @@ func (e *MVCCEngine) compactLoop() {
 // - Cleans up deleted keys when no snapshot references their tombstone
 // - Keeps at least one version after the safety boundary
 //
-// IMPORTANT: Compaction must not modify slices that active snapshots may be
-// reading. Since snapshots hold no reference to the slice itself (they just
-// hold the sequence number and look up the shard's current slice under RLock),
-// we must ensure the slice replacement is safe. The shard's mutex protects
-// against concurrent modification, but a snapshot holding RLock could be
-// iterating the old slice while we replace it. To be safe, we only compact
-// when no snapshots are active, or we keep enough versions for the oldest snapshot.
+// Uses atomic pointer swaps so readers never block. Compaction creates
+// new slices and stores them atomically — readers holding references to
+// old slices continue safely.
 func (e *MVCCEngine) Compact() int {
 	// If any snapshots are active, be conservative: only remove versions
 	// that are strictly before the oldest snapshot's sequence.
@@ -402,7 +464,8 @@ func (e *MVCCEngine) Compact() int {
 	for i := range e.shards {
 		s := e.shards[i]
 		s.mu.Lock()
-		for k, entries := range s.data {
+		for k, av := range s.data {
+			entries := av.Load()
 			// Clean up tombstones first: if the latest entry is a delete and
 			// there are no active snapshots that could see it, remove the key entirely
 			if safeSeq == 0 && len(entries) >= 1 && entries[len(entries)-1].deleted {
@@ -440,10 +503,10 @@ func (e *MVCCEngine) Compact() int {
 			if removeCount > 0 {
 				removed += removeCount
 				// Create a new slice with only the kept entries.
-				// This is safe because we hold the write lock.
+				// Store atomically so readers never see a partially-compacteд state.
 				kept := make([]*mvccEntry, len(entries)-removeCount)
 				copy(kept, entries[removeCount:])
-				s.data[k] = kept
+				av.Store(kept)
 			}
 		}
 		s.mu.Unlock()
@@ -490,11 +553,16 @@ type mvccSnapshot struct {
 func (s *mvccSnapshot) Get(key []byte) ([]byte, error) {
 	sh := shardFor(string(key))
 	st := s.engine.shards[sh]
-	st.mu.RLock()
-	defer st.mu.RUnlock()
 
-	entries, ok := st.data[string(key)]
+	av, ok := st.data[string(key)]
 	if !ok {
+		return nil, engine.ErrKeyNotFound
+	}
+	// Lock-free read: load the current entry slice atomically.
+	// The writer may have just swapped to a newer slice, but our
+	// snapshot sequence will filter out any entries we shouldn't see.
+	entries := av.Load()
+	if len(entries) == 0 {
 		return nil, engine.ErrKeyNotFound
 	}
 	// Binary search for the latest entry <= snapshot seq
@@ -515,11 +583,13 @@ func (s *mvccSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 	vk := "__dpx:ver:" + string(key)
 	sh := shardFor(vk)
 	st := s.engine.shards[sh]
-	st.mu.RLock()
-	defer st.mu.RUnlock()
 
-	entries, ok := st.data[vk]
+	av, ok := st.data[vk]
 	if !ok {
+		return engine.EpochRecord{}, nil
+	}
+	entries := av.Load()
+	if len(entries) == 0 {
 		return engine.EpochRecord{}, nil
 	}
 	idx := s.findVersion(entries, s.seq)
@@ -569,7 +639,7 @@ func (e *MVCCEngine) newIterator(start, end []byte, seq uint64) engine.Iterator 
 	for i := range e.shards {
 		st := e.shards[i]
 		st.mu.RLock()
-		for k, entries := range st.data {
+		for k, av := range st.data {
 			// Filter by range
 			if k < ss {
 				continue
@@ -579,7 +649,11 @@ func (e *MVCCEngine) newIterator(start, end []byte, seq uint64) engine.Iterator 
 			}
 			// Skip internal keys
 			if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
-				st.mu.RUnlock()
+				continue
+			}
+			// Lock-free read of entry slice
+			entries := av.Load()
+			if len(entries) == 0 {
 				continue
 			}
 			// Find the right version

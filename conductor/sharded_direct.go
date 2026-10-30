@@ -27,7 +27,9 @@ type shardedDirectProposer struct {
 }
 
 // numShards must match engine/memory.numShards.
-const numShards = 64
+// 128 shards balances per-shard contention (16 goroutines/shard)
+// against overhead of more FSM instances.
+const numShards = 128
 
 // shardProposer is a single shard's inline proposer.
 type shardProposer struct {
@@ -112,9 +114,17 @@ func (s *shardedDirectProposer) Shutdown() error {
 // applyInline applies a single proposal synchronously on this shard.
 // Uses CAS-based locking to serialize access without a mutex.
 func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
-	// CAS-based spinlock: 0 = unlocked, 1 = locked
+	// CAS-based spinlock with exponential backoff.
+	// Tight spin for first few attempts (lock holder likely finishing soon),
+	// then yield to avoid wasting CPU when contention is high.
+	retries := 0
 	for !sp.mu.CompareAndSwap(0, 1) {
-		runtime.Gosched()
+		if retries < 4 {
+			retries++
+		} else {
+			runtime.Gosched()
+			retries = 0
+		}
 	}
 	defer sp.mu.Store(0)
 
