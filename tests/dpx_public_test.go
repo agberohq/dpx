@@ -1,3 +1,23 @@
+// Package tests provides black-box integration tests for the dpx public API.
+//
+// Coverage targets (for Teller readiness):
+//   - All three convenience constructors (OpenEmbedded, OpenSharded, OpenPebble)
+//   - KVPair type, IsNotFound, IsConflict helpers
+//   - KVStore interface compliance via *Node
+//   - OCC conflict detection, automatic retry, exhaustion
+//   - AtomicAdd credit commutativity (no false conflicts)
+//   - AtomicAdd debit conflict (two concurrent debits, exactly one wins)
+//   - GetRange / GetRangeReverse outside and inside tx
+//   - AllocateNextSequence monotonicity
+//   - WatchKey: fires on write, respects ctx cancel, closes on node.Close
+//   - GetDatabaseTime / GetSafeReadPoint advance after writes
+//   - Backup on Pebble
+//   - ErrStoreClosed after Close on every method
+//   - ErrReservedKey, ErrInvalidProposal
+//   - Sharded balance invariant under concurrent transfers
+//   - Pebble durability: write → close → reopen → read
+//   - Benchmarks: Open*, Transfer_Embedded, Transfer_Sharded, Transfer_Pebble,
+//     AtomicAdd_Credit_Parallel, GetRange_FeedConsumer
 package tests
 
 import (

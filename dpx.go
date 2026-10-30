@@ -198,6 +198,9 @@ func (n *Node) RunInTx(ctx context.Context, fn func(tx KVTx) error) error {
 		}
 		return ErrConflictExhausted
 	}
+	if err == nil && n.metrics != nil {
+		n.metrics.TransactionsTotal.Add(1)
+	}
 	return err
 }
 
@@ -368,6 +371,31 @@ func (n *Node) Backup(_ context.Context, destDir string) error {
 		n.metrics.BackupTotal.Add(1)
 	}
 	return nil
+}
+
+// HealthStatus describes the current state of the node for health checks.
+type HealthStatus struct {
+	Alive             bool
+	Closed            bool
+	SeqCounter        uint64
+	Transactions      uint64
+	Conflicts         uint64
+	ConflictExhausted uint64
+}
+
+// Health returns the current health status of the node.
+func (n *Node) Health() HealthStatus {
+	h := HealthStatus{
+		Alive:      !n.closed.Load(),
+		Closed:     n.closed.Load(),
+		SeqCounter: n.seqCounter.Load(),
+	}
+	if n.metrics != nil {
+		h.Transactions = n.metrics.TransactionsTotal.Load()
+		h.Conflicts = n.metrics.ConflictTotal.Load()
+		h.ConflictExhausted = n.metrics.ConflictExhausted.Load()
+	}
+	return h
 }
 
 // SetBatchConfig replaces the BatchConfig atomically.
