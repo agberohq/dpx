@@ -29,7 +29,7 @@ import (
 )
 
 var (
-	flagEngine      = flag.String("engine", "memory", "storage engine: memory | memory-sharded | pebble")
+	flagEngine      = flag.String("engine", "memory", "storage engine: memory | memory-sharded | mvcc-sharded | pebble")
 	flagDir         = flag.String("dir", "/tmp/dpx-bench", "data directory (pebble only)")
 	flagDuration    = flag.Duration("duration", 15*time.Second, "benchmark duration per run")
 	flagWarmup      = flag.Duration("warmup", 3*time.Second, "warmup period (excluded from results)")
@@ -872,6 +872,8 @@ func main() {
 		eng = memory.New()
 	case "memory-sharded":
 		eng = memory.NewSharded()
+	case "mvcc-sharded":
+		eng = memory.NewMVCCSharded()
 	case "pebble":
 		eng = pebble.New(*flagDir)
 	default:

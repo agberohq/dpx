@@ -149,7 +149,8 @@ func (e *Engine) Close() error {
 		e.snapshotWg.Wait() // wait for refresh goroutine to exit before closing DB
 	}
 	// Close the current shared snapshot before closing the DB.
-	if ss := e.sharedSnap.Load(); ss != nil {
+	// Swap to nil so any pending time.AfterFunc callbacks don't double-close.
+	if ss := e.sharedSnap.Swap(nil); ss != nil {
 		ss.snap.Close()
 	}
 	return e.db.Close()

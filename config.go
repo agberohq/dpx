@@ -126,10 +126,10 @@ func applyDefaults(cfg *Config) {
 		cfg.Batch.MaxBytes = 4 << 20
 	}
 	if cfg.Batch.MinAge == 0 {
-		cfg.Batch.MinAge = 50 * time.Microsecond
+		cfg.Batch.MinAge = 10 * time.Microsecond
 	}
 	if cfg.Batch.MaxAge == 0 {
-		cfg.Batch.MaxAge = 2 * time.Millisecond
+		cfg.Batch.MaxAge = 500 * time.Microsecond
 	}
 	if cfg.Batch.EMAAlpha == 0 {
 		cfg.Batch.EMAAlpha = 0.1
