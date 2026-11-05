@@ -34,9 +34,9 @@ const numShards = 128
 // shardProposer is a single shard's inline proposer.
 type shardProposer struct {
 	fsm      *dpxFSM
-	index    uint64
-	mu       atomic.Uint32 // used as a spinlock for serial access
-	shardIdx int           // shard index for routing
+	index    *atomic.Uint64 // SHARED across all shards: epochs must be globally monotonic
+	mu       atomic.Uint32  // used as a spinlock for serial access
+	shardIdx int            // shard index for routing
 }
 
 func newShardedDirectProposer(
@@ -47,6 +47,12 @@ func newShardedDirectProposer(
 	telemetry *shared.Telemetry,
 ) (*shardedDirectProposer, error) {
 	s := &shardedDirectProposer{}
+	// One epoch counter for every shard. Version records store this value and
+	// detectConflict compares it against keyEpoch; if each shard kept its own
+	// counter, a key written by a "low-count" shard after being written by a
+	// "high-count" shard would get a SMALLER epoch than the stale keyEpoch,
+	// producing permanent false conflicts on retry.
+	globalIndex := &atomic.Uint64{}
 	for i := range s.shards {
 		clock := hlc.NewClock()
 		f := newFSM(eng, syncPolicy, w, metrics, clock)
@@ -56,6 +62,7 @@ func newShardedDirectProposer(
 		}
 		s.shards[i] = &shardProposer{
 			fsm:      f,
+			index:    globalIndex,
 			shardIdx: i,
 		}
 	}
@@ -128,8 +135,7 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 	}
 	defer sp.mu.Store(0)
 
-	sp.index++
-	idx := sp.index
+	idx := sp.index.Add(1)
 
 	// Conflict detection
 	conflict := false
@@ -170,33 +176,61 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 		defer sp.fsm.vkBufPool.Put(vkBuf)
 
 		var epochBuf [9]byte
-		writes := make([]memory.MVCCWriteOp, 0, len(p.Writes)+2) // +2 for version keys and applied
-
+		// Route every write to the ENGINE shard that readers will use for
+		// that key. GetVersion looks up "__dpx:ver:<userKey>" in
+		// engine/memory.shardFor(versionKey) — the version key MUST land in
+		// that same shard, otherwise debit read-sets hydrate epoch 0 while
+		// this shard's keyEpoch holds the real epoch, producing permanent
+		// ErrConflictExhausted on second debits of the same key. User keys
+		// are routed by their own hash; point/range reads use shardFor(key)
+		// directly, so user data and version data are both consistent per
+		// key. Each key group is applied to its own engine shard under the
+		// proposal's single CAS-serialized inline path.
+		type shardGroup struct {
+			user []memory.MVCCWriteOp
+			ver  []memory.MVCCWriteOp
+		}
+		groups := make(map[int][]memory.MVCCWriteOp, len(p.Writes)+1)
+		groupFor := func(sh int) []memory.MVCCWriteOp {
+			g, ok := groups[sh]
+			if !ok {
+				g = make([]memory.MVCCWriteOp, 0, len(p.Writes)+2)
+				groups[sh] = g
+			}
+			return g
+		}
 		for _, w := range p.Writes {
 			isCredit := w.Op == shared.OpCredit
+			sh := memory.EngineShardFor(string(w.Key))
 			switch w.Op {
 			case shared.OpSet:
-				writes = append(writes, memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 's'})
+				groups[sh] = append(groupFor(sh),
+					memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 's'})
 			case shared.OpDelete:
-				writes = append(writes, memory.MVCCWriteOp{Key: string(w.Key), Op: 'd'})
+				groups[sh] = append(groupFor(sh),
+					memory.MVCCWriteOp{Key: string(w.Key), Op: 'd'})
 			case shared.OpCredit, shared.OpDebit:
-				writes = append(writes, memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 'm'})
+				groups[sh] = append(groupFor(sh),
+					memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 'm'})
 			}
 			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
-			writes = append(writes, memory.MVCCWriteOp{
-				Key:   string(versionKey(vkBuf, w.Key)),
-				Value: encodeEpochRecord(er, epochBuf[:]),
-				Op:    's',
-			})
+			vk := string(versionKey(vkBuf, w.Key))
+			vsh := memory.EngineShardFor(vk)
+			groups[vsh] = append(groupFor(vsh),
+				memory.MVCCWriteOp{Key: vk, Value: encodeEpochRecord(er, epochBuf[:]), Op: 's'})
 			sp.fsm.state.keyEpoch[string(w.Key)] = er
 		}
-		writes = append(writes, memory.MVCCWriteOp{
-			Key:   string(appliedKey),
-			Value: encodeUint64(idx, epochBuf[:8]),
-			Op:    's',
-		})
+		{
+			vk := string(appliedKey)
+			sh := memory.EngineShardFor(vk)
+			groups[sh] = append(groupFor(sh), memory.MVCCWriteOp{
+				Key:   vk,
+				Value: encodeUint64(idx, epochBuf[:8]),
+				Op:    's',
+			})
+		}
 
-		commitSeq := mvccEng.ApplyShardDirect(sp.shardIdx, writes)
+		commitSeq := mvccEng.ApplyShardsDirect(groups)
 		sp.fsm.applied.Store(commitSeq)
 	} else {
 		// Fallback: standard ApplyBatch path for non-MVCC engines
@@ -228,7 +262,7 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 			return shared.ApplyResult{Err: err}
 		}
 
-		sp.fsm.applied.Store(sp.index)
+		sp.fsm.applied.Store(idx)
 		if sp.fsm.syncPolicy == shared.SyncBatch {
 			sp.fsm.engine.Sync()
 		}

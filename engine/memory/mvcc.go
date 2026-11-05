@@ -337,6 +337,89 @@ type MVCCWriteOp struct {
 	Op    byte // 's' = set, 'd' = delete, 'm' = merge
 }
 
+// EngineShardFor reports the engine shard a key hashes to. Exported so the
+// conductor can route version keys to the shard GetVersion will read from.
+func EngineShardFor(key string) int {
+	return shardFor(key)
+}
+
+// ApplyShardsDirect applies per-shard write groups under one commit sequence.
+// Each group is applied to its own engine shard; all entries across groups
+// share the same commitSeq so a snapshot sees all or none of them.
+// Caller must hold the proposer-level serialization (CAS spinlock).
+func (e *MVCCEngine) ApplyShardsDirect(groups map[int][]MVCCWriteOp) uint64 {
+	total := 0
+	for _, ws := range groups {
+		total += len(ws)
+	}
+	if total == 0 {
+		return e.seqCounter.Load()
+	}
+	commitSeq := e.seqCounter.Add(uint64(total))
+
+	for shardIdx, ws := range groups {
+		if len(ws) == 0 {
+			continue
+		}
+		e.applyOneShard(shardIdx, ws, commitSeq)
+	}
+
+	// Mark this commit as fully visible (monotonic; see ApplyBatch).
+	for {
+		cur := e.lastCommitted.Load()
+		if commitSeq <= cur {
+			break
+		}
+		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
+			break
+		}
+	}
+	return commitSeq
+}
+
+// applyOneShard applies one shard group's ops at the given commit sequence.
+func (e *MVCCEngine) applyOneShard(shardIdx int, ws []MVCCWriteOp, commitSeq uint64) {
+	s := e.shards[shardIdx]
+
+	type keyedOp struct {
+		key   string
+		entry *mvccEntry
+		op    byte
+		value []byte
+	}
+	ops := make([]keyedOp, 0, len(ws))
+	for _, w := range ws {
+		entry := &mvccEntry{
+			seq:     commitSeq,
+			value:   w.Value,
+			deleted: w.Op == 'd',
+		}
+		ops = append(ops, keyedOp{key: w.Key, entry: entry, op: w.Op, value: w.Value})
+	}
+
+	s.mu.Lock()
+	for _, ko := range ops {
+		av, ok := s.data[ko.key]
+		if !ok {
+			av = newAtomicValue(nil)
+			s.data[ko.key] = av
+		}
+		entries := av.Load()
+		switch ko.op {
+		case 's', 'd':
+			entries = append(entries, ko.entry)
+		case 'm':
+			current := e.getCurrentValue(entries)
+			delta := decodeInt64MVCC(ko.value)
+			newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
+			ko.entry.value = newVal
+			entries = append(entries, ko.entry)
+		}
+		av.Store(entries)
+	}
+	s.mu.Unlock()
+}
+
 // ApplyShardDirect applies writes directly to a specific shard.
 // The caller MUST already hold exclusive writer access to this shard
 // (e.g., via the sharded proposer's CAS spinlock).
