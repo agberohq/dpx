@@ -38,6 +38,14 @@ func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 		// Translate the engine-level sentinel to the dpx-level sentinel so
 		// callers can use dpx.IsNotFound without importing engine.
 		if err == engine.ErrKeyNotFound {
+			// A read of a MISSING key must still join the read set. Without
+			// this, every check-then-create pattern is racy: multiple
+			// transactions can all observe "absent" and all create the key,
+			// producing lost updates and forked chains. With the entry
+			// recorded, a concurrent create raises the key epoch and this
+			// transaction conflicts and retries.
+			k := string(key)
+			tx.readSet[k] = shared.ReadEntry{Key: []byte(k), Epoch: 0, IsDebit: false}
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
@@ -91,6 +99,11 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 			Key:   cpKey,
 			Value: encodeInt64(delta),
 		})
+		// Credit path is lock-free: the current value is read only to
+		// establish the snapshot base, and the authoritative post-add value
+		// is not known here. Return the snapshot-time value, matching the
+		// documented contract for positive deltas (see store.KVTx.AtomicAdd:
+		// only delta <= 0 promises the new value).
 		return decodeInt64(val), nil
 	}
 	val, err := tx.snap.Get(key)

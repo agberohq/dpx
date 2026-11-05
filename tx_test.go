@@ -195,7 +195,10 @@ func TestTx_Get_ReadOnlyTxNeverPaysVersionCost(t *testing.T) {
 	}
 }
 
-func TestTx_Get_MissingKeyNotInReadSet(t *testing.T) {
+// TestTx_Get_MissingKeyInReadSet: a read that observes "absent" must be
+// conflict-tracked. Otherwise concurrent check-then-create transactions all
+// see absent and all create, losing updates and forking chains.
+func TestTx_Get_MissingKeyInReadSet(t *testing.T) {
 	snap := newFakeSnapshot(1)
 	tx := newTx(snap)
 	ctx := context.Background()
@@ -204,8 +207,8 @@ func TestTx_Get_MissingKeyNotInReadSet(t *testing.T) {
 	if err != ErrKeyNotFound {
 		t.Errorf("got %v, want ErrKeyNotFound", err)
 	}
-	if _, ok := tx.readSet["missing"]; ok {
-		t.Error("missing key should not be in readSet")
+	if _, ok := tx.readSet["missing"]; !ok {
+		t.Error("missing key must be in readSet so a concurrent insert conflicts")
 	}
 }
 

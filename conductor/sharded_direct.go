@@ -3,6 +3,7 @@ package conductor
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -22,8 +23,10 @@ var errShardedClosed = errors.New("dpx/raft: sharded proposer closed")
 // CAS spinlock serializes access. The inline path eliminates all channel
 // overhead, reducing per-proposal latency from ~9ms to ~150µs.
 type shardedDirectProposer struct {
-	shards [numShards]*shardProposer
-	closed atomic.Bool
+	shards   [numShards]*shardProposer
+	closed   atomic.Bool
+	epochMu  sync.Mutex                    // serializes conflict-check + apply across shards
+	keyEpoch map[string]engine.EpochRecord // SHARED conflict map (global, not per-proposer)
 }
 
 // numShards must match engine/memory.numShards.
@@ -37,6 +40,7 @@ type shardProposer struct {
 	index    *atomic.Uint64 // SHARED across all shards: epochs must be globally monotonic
 	mu       atomic.Uint32  // used as a spinlock for serial access
 	shardIdx int            // shard index for routing
+	owner    *shardedDirectProposer
 }
 
 func newShardedDirectProposer(
@@ -53,6 +57,7 @@ func newShardedDirectProposer(
 	// "high-count" shard would get a SMALLER epoch than the stale keyEpoch,
 	// producing permanent false conflicts on retry.
 	globalIndex := &atomic.Uint64{}
+	s.keyEpoch = make(map[string]engine.EpochRecord, 1<<16)
 	for i := range s.shards {
 		clock := hlc.NewClock()
 		f := newFSM(eng, syncPolicy, w, metrics, clock)
@@ -60,10 +65,15 @@ func newShardedDirectProposer(
 		if _, err := f.open(nil); err != nil {
 			return nil, err
 		}
+		// Every shard shares ONE conflict map. A per-shard map makes writes
+		// applied by another shard invisible, so cross-shard conflicts are
+		// never detected (lost updates, forked chains).
+		f.state.keyEpoch = s.keyEpoch
 		s.shards[i] = &shardProposer{
 			fsm:      f,
 			index:    globalIndex,
 			shardIdx: i,
+			owner:    s,
 		}
 	}
 	return s, nil
@@ -134,6 +144,16 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 		}
 	}
 	defer sp.mu.Store(0)
+
+	// Conflict detection and application must be atomic with respect to ALL
+	// shards, because the conflict map is global: another shard may write a
+	// key this proposal read. Without this lock two proposals can both observe
+	// an absent key and both create it (check-then-create race).
+	owner := sp.owner
+	if owner != nil {
+		owner.epochMu.Lock()
+		defer owner.epochMu.Unlock()
+	}
 
 	idx := sp.index.Add(1)
 
