@@ -68,12 +68,28 @@ type MVCCEngine struct {
 
 // mvccShard is a single shard's MVCC data.
 // For sharded mode, the data map uses atomic.Value per key so readers
-// (snapshots) can load entry slices without any mutex, while writers
-// (ApplyShardDirect) create new slices and store them atomically.
-// This eliminates the RWMutex contention that was consuming 28% of CPU.
+// (snapshots) can load entry slices without holding any lock for the
+// duration of the read, while writers (ApplyShardDirect) create new
+// slices and store them atomically.
+// The map itself still requires a brief RLock per lookup: writers insert
+// keys under a write lock, and an unlocked map read racing a map write is
+// undefined behaviour in Go (race detector violation, possible crash).
+// The RLock is held only for the pointer resolution; entry-slice reads
+// that follow are lock-free (see atomicValue).
 type mvccShard struct {
-	mu   sync.RWMutex            // used only for non-sharded path and compaction
+	mu   sync.RWMutex            // guards the data map structure
 	data map[string]*atomicValue // key -> atomic pointer to []*mvccEntry
+}
+
+// lookup resolves the atomic value for key under a brief read lock, or
+// returns nil if the key is absent. The returned pointer stays valid for
+// the lifetime of the engine: compaction swaps slice contents atomically
+// and never frees the atomicValue while readers may hold it.
+func (s *mvccShard) lookup(key string) *atomicValue {
+	s.mu.RLock()
+	av := s.data[key]
+	s.mu.RUnlock()
+	return av
 }
 
 // atomicValue wraps []*mvccEntry with atomic load/store for lock-free reads.
@@ -189,11 +205,10 @@ func (e *MVCCEngine) SetTelemetry(r engine.StageRecorder) {
 }
 
 func (e *MVCCEngine) Get(key []byte) ([]byte, error) {
-	sh := shardFor(string(key))
-	s := e.shards[sh]
+	s := e.shards[shardFor(string(key))]
 
-	av, ok := s.data[string(key)]
-	if !ok {
+	av := s.lookup(string(key))
+	if av == nil {
 		return nil, engine.ErrKeyNotFound
 	}
 	entries := av.Load()
@@ -299,7 +314,18 @@ func (e *MVCCEngine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
 
 	// Mark this commit as fully visible. Snapshots taken after this point
 	// will see all entries in this batch.
-	e.lastCommitted.Store(commitSeq)
+	// Monotonic store: a concurrent batch may already have published a
+	// higher sequence; lastCommitted must never regress, or a snapshot
+	// created afterwards would be older than one created earlier.
+	for {
+		cur := e.lastCommitted.Load()
+		if commitSeq <= cur {
+			break
+		}
+		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
+			break
+		}
+	}
 
 	return nil
 }
@@ -315,17 +341,20 @@ type MVCCWriteOp struct {
 // The caller MUST already hold exclusive writer access to this shard
 // (e.g., via the sharded proposer's CAS spinlock).
 //
-// LOCK-FREE READERS: Entry slice reads (snap.Get) use atomic pointer swaps
-// and never block. However, the shard's data map itself requires a mutex
-// for add/delete operations (new keys, compaction cleanup), because Go
-// doesn't allow concurrent map iteration and write. The mutex is held only
-// briefly — just long enough to process all writes and store new slice pointers.
+// SHORT-LOCK READERS: point lookups resolve the shard's map entry under a
+// brief RLock (mvccShard.lookup); the entry-slice reads that follow use
+// atomic pointer swaps and never block. The data map itself requires a
+// write lock for add/delete operations (new keys, compaction cleanup),
+// because Go doesn't allow concurrent map reads racing a map write. Writers
+// hold it only briefly — just long enough to process all writes and store
+// new slice pointers. Since the CAS spinlock serializes writers, the mutex
+// only contends with point-read lockups and Compact(), which runs in the
+// background every 100ms.
 // Since the CAS spinlock serializes writers, the mutex only contends with
 // Compact() which runs in the background every 100ms.
 //
 // Returns the commit sequence assigned to this batch.
-func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64 {
-	// Atomic commit protocol: assign a single commit sequence for this shard's writes.
+func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64 { // Atomic commit protocol: assign a single commit sequence for this shard's writes.
 	commitSeq := e.seqCounter.Add(uint64(len(writes)))
 
 	s := e.shards[shardIdx]
@@ -370,8 +399,16 @@ func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64
 	}
 	s.mu.Unlock()
 
-	// Mark this commit as fully visible.
-	e.lastCommitted.Store(commitSeq)
+	// Mark this commit as fully visible (monotonic; see ApplyBatch).
+	for {
+		cur := e.lastCommitted.Load()
+		if commitSeq <= cur {
+			break
+		}
+		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
+			break
+		}
+	}
 
 	return commitSeq
 }
@@ -554,8 +591,8 @@ func (s *mvccSnapshot) Get(key []byte) ([]byte, error) {
 	sh := shardFor(string(key))
 	st := s.engine.shards[sh]
 
-	av, ok := st.data[string(key)]
-	if !ok {
+	av := st.lookup(string(key))
+	if av == nil {
 		return nil, engine.ErrKeyNotFound
 	}
 	// Lock-free read: load the current entry slice atomically.
@@ -584,8 +621,8 @@ func (s *mvccSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 	sh := shardFor(vk)
 	st := s.engine.shards[sh]
 
-	av, ok := st.data[vk]
-	if !ok {
+	av := st.lookup(vk)
+	if av == nil {
 		return engine.EpochRecord{}, nil
 	}
 	entries := av.Load()

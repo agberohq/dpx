@@ -177,8 +177,13 @@ func (d *directProposer) ProposeDirect(p *shared.Proposal) (shared.ApplyResult, 
 		// all references are released.
 		return res, nil
 	case <-d.done:
-		entry.p = nil
-		entryPool.Put(entry)
+		// After the send above, the entry belongs to the applier: it may
+		// already have received it from submitCh and be applying it right
+		// now, so touching entry (entry.p = nil, entryPool.Put) here would
+		// race the applier's reads and double-return the entry to the
+		// pool. The applier either applies the entry and pools it
+		// normally, or — if it exited before receiving it — the entry
+		// stays in the channel buffer and is collected by the GC.
 		return shared.ApplyResult{}, errDirectClosed
 	}
 }
@@ -400,6 +405,13 @@ func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 	for i, entry := range entries {
 		if results[i].Err == nil && !results[i].Conflict && d.fsm.watchers != nil {
 			d.fsm.watchers.NotifyBatch(entry.p.Writes, d.fsm.metrics)
+		}
+		// Drain first: an entry reused after a shutdown-abandoned request
+		// may still hold an unread buffered result, which would block this
+		// send forever. resultCh has capacity 1, so drain+send never blocks.
+		select {
+		case <-entry.resultCh:
+		default:
 		}
 		entry.resultCh <- results[i]
 		// Return entry to pool AFTER all references to entry.p are released.

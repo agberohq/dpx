@@ -565,12 +565,18 @@ func TestConcurrentCrashDurability(t *testing.T) {
 			t.Logf("Concurrent crash: %s | Recovery: %s | Successes: %d | Total balance: %d | Bytes/tx: %.1f",
 				tc.name, recoveryTime, successes.Load(), total, float64(bd.TotalSize)/float64(successes.Load()))
 
-			// Balance should be non-negative and less than total possible
+			// Balance should be non-negative.
 			if total < 0 {
 				t.Errorf("negative balance: %d", total)
 			}
-			if total > int64(successes.Load()) {
-				t.Errorf("balance %d exceeds successes %d", total, successes.Load())
+			// Upper bound: every counted success was applied, but in-flight
+			// transactions whose response was lost at crash time may also
+			// have been applied by the engine before the client gave up
+			// (lost-ACK uncertainty). At most one txn per goroutine can be
+			// in flight at close, so allow that slack.
+			if total > int64(successes.Load())+concurrency {
+				t.Errorf("balance %d exceeds successes %d + %d in-flight allowance",
+					total, successes.Load(), concurrency)
 			}
 		})
 	}

@@ -107,6 +107,14 @@ Pebble LSM-tree backend. Data persists across restarts. Use when durability is r
 node, _ := dpx.OpenPebble(dpx.Config{DataDir: "/var/lib/dpx"})
 ```
 
+### Oshodi (Durable, Embedded)
+
+Oshodi is a high-performance embedded KV store with buckets, pub/sub, analytics, and graph traversals. Data persists across restarts. Use when you need durability with additional features like built-in pub/sub messaging and property graph queries.
+
+```go
+node, _ := dpx.OpenOshodi(dpx.Config{DataDir: "/var/lib/dpx"})
+```
+
 ### Distributed (Raft)
 
 Multi-node cluster with HashiCorp Raft consensus. Use for cross-datacenter replication.

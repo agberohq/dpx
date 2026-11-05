@@ -7,6 +7,7 @@ package dpx
 import (
 	"github.com/agberohq/dpx/conductor"
 	"github.com/agberohq/dpx/engine/memory"
+	"github.com/agberohq/dpx/engine/oshodi"
 	"github.com/agberohq/dpx/engine/pebble"
 )
 
@@ -83,5 +84,21 @@ func OpenPebble(cfg Config) (*Node, error) {
 		cfg.DataDir = "/tmp/dpx-pebble"
 	}
 	cfg.Engine = pebble.New(cfg.DataDir)
+	return Open(cfg, conductor.Open)
+}
+
+// OpenOshodi opens an Oshodi-backed DPX node.
+// Oshodi is a high-performance embedded KV store with buckets, pub/sub,
+// and graph traversals. Data is durable across restarts. cfg.DataDir must
+// be set to the directory where Oshodi will store its data files.
+//
+// Example:
+//
+//	node, err := dpx.OpenOshodi(dpx.Config{DataDir: "/var/lib/teller/dpx"})
+func OpenOshodi(cfg Config) (*Node, error) {
+	if cfg.DataDir == "" {
+		cfg.DataDir = "/tmp/dpx-oshodi"
+	}
+	cfg.Engine = oshodi.New(cfg.DataDir)
 	return Open(cfg, conductor.Open)
 }
