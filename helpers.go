@@ -102,10 +102,38 @@ func clampDuration(d, min, max time.Duration) time.Duration {
 // Iterator collection
 
 // collectIter drains an Iterator into a []KVPair slice.
-// Reverse uses collect-then-reverse: correct for all Iterator implementations
-// regardless of Prev()-after-exhaustion behaviour.
+//
+// Forward scans take the first `limit` keys from `start`; reverse scans must
+// take the LAST `limit` keys before `end` (a reverse scan starts at the end of
+// the range). Taking the first `limit` and reversing them — the previous
+// behaviour — returned the OLDEST keys for any limit, which silently broke
+// "most recent" queries such as DAG.FindLatest (limit 1).
+//
+// Iterators expose First/Next/Prev but no seek-to-last, so a reverse scan
+// walks forward while retaining only the trailing `limit` entries.
 func collectIter(iter engine.Iterator, limit int, reverse bool) ([]KVPair, error) {
 	defer iter.Close()
+
+	if reverse {
+		var tail []KVPair
+		for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
+			tail = append(tail, KVPair{
+				Key:   append([]byte(nil), iter.Key()...),
+				Value: append([]byte(nil), iter.Value()...),
+			})
+			if limit > 0 && len(tail) > limit {
+				// Drop the oldest entry; memory stays bounded by limit.
+				tail = append(tail[:0], tail[1:]...)
+			}
+		}
+		if err := iter.Error(); err != nil {
+			return nil, err
+		}
+		for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
+			tail[i], tail[j] = tail[j], tail[i]
+		}
+		return tail, nil
+	}
 
 	var pairs []KVPair
 	for ok := iter.First(); ok && iter.Valid(); ok = iter.Next() {
@@ -119,11 +147,6 @@ func collectIter(iter engine.Iterator, limit int, reverse bool) ([]KVPair, error
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
-	}
-	if reverse {
-		for i, j := 0, len(pairs)-1; i < j; i, j = i+1, j-1 {
-			pairs[i], pairs[j] = pairs[j], pairs[i]
-		}
 	}
 	return pairs, nil
 }
