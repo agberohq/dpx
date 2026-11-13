@@ -1,3 +1,6 @@
 .idea
 dpx.comb.txt
 _*/
+/bin/
+/dist/
+.DS_Store
