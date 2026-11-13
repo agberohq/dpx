@@ -14,8 +14,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/agberohq/dpx/engine"
@@ -28,32 +26,7 @@ type Engine struct {
 	db        *pebble.DB
 	dir       string
 	telemetry engine.StageRecorder
-
-	// sharedSnap is a pooled read snapshot refreshed every snapshotRefreshInterval.
-	// db.NewSnapshot() pins memtable/SST references and was costing 10–22ms per
-	// call at 100K keys. Sharing one snapshot across all concurrent readers
-	// amortises that cost: GetSnapshot() returns the current shared snapshot
-	// wrapped in a no-op closer, paying only an atomic load.
-	//
-	// Safety: the snapshot is swapped atomically; the old snapshot is closed
-	// after snapshotRefreshInterval so any reader that grabbed it before the
-	// swap has time to finish. seq is updated alongside the snapshot so
-	// Sequence() remains accurate.
-	sharedSnap   atomic.Pointer[sharedSnapshot]
-	snapshotStop chan struct{}
-	snapshotWg   sync.WaitGroup
 }
-
-// sharedSnapshot bundles a Pebble snapshot with its sequence number.
-type sharedSnapshot struct {
-	snap *pebble.Snapshot
-	seq  uint64
-}
-
-// snapshotRefreshInterval controls how often the shared snapshot is replaced.
-// 1ms matches the directProposer's defaultFlushInterval — a new snapshot is
-// available within one commit cycle, keeping reads within ~1ms of freshness.
-const snapshotRefreshInterval = 1 * time.Millisecond
 
 // New creates a Pebble engine that stores data in dir.
 // Open must be called before any reads or writes.
@@ -89,10 +62,6 @@ func (e *Engine) Open() error {
 		// Explicit cap prevents fd exhaustion when running many concurrent tests.
 		MaxOpenFiles: 1000,
 
-		// Disable the rate limiter for compaction I/O — we want compaction to
-		// run as fast as possible so it doesn't block foreground writes.
-		// Zero means unlimited; the default 0 already does this but being
-		// explicit documents intent.
 		DisableWAL: false,
 	}
 	db, err := pebble.Open(e.dir, opts)
@@ -100,60 +69,18 @@ func (e *Engine) Open() error {
 		return err
 	}
 	e.db = db
-	e.snapshotStop = make(chan struct{})
-	e.refreshSharedSnapshot() // create initial snapshot synchronously
-	e.snapshotWg.Add(1)
-	go e.snapshotRefreshLoop() // start background refresh goroutine
 	return nil
 }
 
-// refreshSharedSnapshot atomically replaces the shared snapshot.
-// Called from Open() and from snapshotRefreshLoop().
-func (e *Engine) refreshSharedSnapshot() {
-	seq := e.CurrentSequence()
-	snap := e.db.NewSnapshot()
-	old := e.sharedSnap.Swap(&sharedSnapshot{snap: snap, seq: seq})
-	if old != nil {
-		// Close old snapshot after a grace period so in-flight readers finish.
-		// A reader that grabbed the old snapshot has at most snapshotRefreshInterval
-		// to complete its reads before the snapshot is closed.
-		time.AfterFunc(snapshotRefreshInterval*2, func() {
-			old.snap.Close()
-		})
-	}
-}
-
-// snapshotRefreshLoop periodically refreshes the shared read snapshot.
-// Runs as a background goroutine for the lifetime of the engine.
-func (e *Engine) snapshotRefreshLoop() {
-	defer e.snapshotWg.Done()
-	ticker := time.NewTicker(snapshotRefreshInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			e.refreshSharedSnapshot()
-		case <-e.snapshotStop:
-			return
-		}
-	}
-}
-
 // Close flushes the WAL and releases all Pebble resources.
+// It is idempotent: a second call is a no-op.
 func (e *Engine) Close() error {
 	if e.db == nil {
 		return nil
 	}
-	if e.snapshotStop != nil {
-		close(e.snapshotStop)
-		e.snapshotWg.Wait() // wait for refresh goroutine to exit before closing DB
-	}
-	// Close the current shared snapshot before closing the DB.
-	// Swap to nil so any pending time.AfterFunc callbacks don't double-close.
-	if ss := e.sharedSnap.Swap(nil); ss != nil {
-		ss.snap.Close()
-	}
-	return e.db.Close()
+	err := e.db.Close()
+	e.db = nil
+	return err
 }
 
 // Get returns the current committed value for key.
@@ -172,13 +99,8 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
-// GetSnapshot returns the current shared snapshot.
-// Cost: one atomic pointer load — no new Pebble snapshot allocation.
-// The snapshot is refreshed every snapshotRefreshInterval in the background.
 // GetSnapshot returns a private point-in-time snapshot isolated from
 // subsequent writes. Each caller gets their own snapshot and must Close() it.
-// The background sharedSnap goroutine keeps Pebble's block cache primed so
-// reads against this snapshot hit cache rather than disk.
 func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
 	seq := e.CurrentSequence()
 	snap := e.db.NewSnapshot()
@@ -259,65 +181,7 @@ func (e *Engine) RawIter(start, end []byte) engine.Iterator {
 	return &pebbleIter{iter: iter}
 }
 
-// Snapshots
-
-// pebbleSharedSnapshot wraps the pooled shared snapshot.
-// Close() is a no-op — the snapshot lifecycle is managed by snapshotRefreshLoop.
-type pebbleSharedSnapshot struct {
-	ss        *sharedSnapshot
-	telemetry engine.StageRecorder
-}
-
-func (s *pebbleSharedSnapshot) Get(key []byte) ([]byte, error) {
-	val, closer, err := s.ss.snap.Get(key)
-	if errors.Is(err, pebble.ErrNotFound) {
-		return nil, engine.ErrKeyNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer closer.Close()
-	cp := make([]byte, len(val))
-	copy(cp, val)
-	return cp, nil
-}
-
-func (s *pebbleSharedSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
-	vk := append(append(make([]byte, 0, 10+len(key)), "__dpx:ver:"...), key...)
-	val, closer, err := s.ss.snap.Get(vk)
-	if errors.Is(err, pebble.ErrNotFound) {
-		return engine.EpochRecord{}, nil
-	}
-	if err != nil {
-		return engine.EpochRecord{}, err
-	}
-	defer closer.Close()
-	return decodeEpochRecord(val), nil
-}
-
-func (s *pebbleSharedSnapshot) NewIter(start, end []byte) engine.Iterator {
-	var matStart time.Time
-	if s.telemetry != nil {
-		matStart = time.Now()
-	}
-	iter, err := s.ss.snap.NewIter(&pebble.IterOptions{
-		LowerBound: start,
-		UpperBound: end,
-	})
-	if s.telemetry != nil {
-		s.telemetry.RecordIterMaterialise(time.Since(matStart))
-	}
-	if err != nil {
-		return &errIter{err: err}
-	}
-	return &pebbleConsumerIter{iter: iter}
-}
-
-func (s *pebbleSharedSnapshot) Sequence() uint64 { return s.ss.seq }
-func (s *pebbleSharedSnapshot) Close() error     { return nil } // owned by refreshLoop
-
-// pebbleSnapshot — used only for writes that explicitly need a fresh snapshot.
-// pebbleSnapshot is returned by GetSnapshot() — private, caller-owned.
+// pebbleSnapshot is returned by GetSnapshot(): private and caller-owned.
 type pebbleSnapshot struct {
 	snap      *pebble.Snapshot
 	seq       uint64
