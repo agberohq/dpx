@@ -263,7 +263,7 @@ func (e *Engine) readApplied() (uint64, error) {
 	return binary.LittleEndian.Uint64(val), nil
 }
 
-// --- Snapshot ---
+// Snapshot
 
 type oshodiSnapshot struct {
 	data      map[string][]byte
@@ -332,7 +332,7 @@ func (s *oshodiSnapshot) NewIter(start, end []byte) engine.Iterator {
 func (s *oshodiSnapshot) Sequence() uint64 { return s.seq }
 func (s *oshodiSnapshot) Close() error     { return nil }
 
-// --- Batch ---
+// Batch
 
 type batchOp struct {
 	op    byte
@@ -368,7 +368,7 @@ func (b *oshodiBatch) Merge(key, value []byte) {
 
 func (b *oshodiBatch) Reset() { b.ops = b.ops[:0] }
 
-// --- Iterator ---
+// Iterator
 
 type oshodiIter struct {
 	pairs [][2][]byte
@@ -426,7 +426,7 @@ func (i *errIter) Value() []byte { return nil }
 func (i *errIter) Error() error  { return i.err }
 func (i *errIter) Close() error  { return nil }
 
-// --- Helpers ---
+// Helpers
 
 func encodeInt64(v int64) []byte {
 	b := make([]byte, 8)

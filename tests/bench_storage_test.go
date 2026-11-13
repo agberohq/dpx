@@ -1,13 +1,13 @@
 // Package tests provides comprehensive storage engine comparison benchmarks.
 //
 // It evaluates 7 configurations:
-//  1. In-memory MVCC only
-//  2. Pebble alone (SyncNone)
-//  3. Badger alone (SyncNone)
-//  4. MVCC + Pebble, sync disabled (Pebble as durable backing, no fsync)
-//  5. MVCC + Pebble, group commit with sync (Pebble with periodic fsync)
-//  6. MVCC + Badger, group commit with sync (Badger with periodic fsync)
-//  7. Pebble SyncFull (full fsync on every write)
+// In-memory MVCC only
+// Pebble alone (SyncNone)
+// Badger alone (SyncNone)
+// MVCC + Pebble, sync disabled (Pebble as durable backing, no fsync)
+// MVCC + Pebble, group commit with sync (Pebble with periodic fsync)
+// MVCC + Badger, group commit with sync (Badger with periodic fsync)
+// Pebble SyncFull (full fsync on every write)
 //
 // Metrics measured:
 //   - Sustained TPS: Actual processing capacity
@@ -202,7 +202,7 @@ func printComparison(results []*BenchmarkResult) {
 	fmt.Println("\n╚══════════════════════════════════════════════════════════════╝")
 }
 
-// ======================== Configuration 1: MVCC Only ========================
+// Configuration 1: MVCC Only
 
 func benchmarkMVCCOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("MVCC_Only", func(t *testing.T) {
@@ -222,7 +222,7 @@ func benchmarkMVCCOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	return &BenchmarkResult{Name: "MVCC Only"}
 }
 
-// ======================== Configuration 2: Pebble Only ========================
+// Configuration 2: Pebble Only
 
 func benchmarkPebbleOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("Pebble_Only", func(t *testing.T) {
@@ -247,7 +247,7 @@ func benchmarkPebbleOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	return &BenchmarkResult{Name: "Pebble Only (SyncNone)"}
 }
 
-// ======================== Configuration 3: Badger Only ========================
+// Configuration 3: Badger Only
 
 func benchmarkBadgerOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("Badger_Only", func(t *testing.T) {
@@ -276,7 +276,7 @@ func benchmarkBadgerOnly(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	return &BenchmarkResult{Name: "Badger Only (SyncNone)"}
 }
 
-// ======================== Configuration 4: MVCC + Pebble, No Sync ========================
+// Configuration 4: MVCC + Pebble, No Sync
 
 func benchmarkMVCCPebbleNoSync(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("MVCC_Pebble_NoSync", func(t *testing.T) {
@@ -305,7 +305,7 @@ func benchmarkMVCCPebbleNoSync(t *testing.T, cfg BenchmarkConfig) *BenchmarkResu
 	return &BenchmarkResult{Name: "Pebble (SyncNone)"}
 }
 
-// ======================== Configuration 5: MVCC + Pebble, Group Commit ========================
+// Configuration 5: MVCC + Pebble, Group Commit
 
 func benchmarkMVCCPebbleGroupCommit(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("Pebble_GroupCommit", func(t *testing.T) {
@@ -334,7 +334,7 @@ func benchmarkMVCCPebbleGroupCommit(t *testing.T, cfg BenchmarkConfig) *Benchmar
 	return &BenchmarkResult{Name: "Pebble (SyncBatch)"}
 }
 
-// ======================== Configuration 6: MVCC + Badger, Group Commit ========================
+// Configuration 6: MVCC + Badger, Group Commit
 
 func benchmarkMVCCBadgerGroupCommit(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("Badger_GroupCommit", func(t *testing.T) {
@@ -363,7 +363,7 @@ func benchmarkMVCCBadgerGroupCommit(t *testing.T, cfg BenchmarkConfig) *Benchmar
 	return &BenchmarkResult{Name: "Badger (SyncBatch)"}
 }
 
-// ======================== Configuration 7: Pebble SyncFull ========================
+// Configuration 7: Pebble SyncFull
 
 func benchmarkPebbleSyncFull(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult {
 	t.Run("Pebble_SyncFull", func(t *testing.T) {
@@ -388,7 +388,7 @@ func benchmarkPebbleSyncFull(t *testing.T, cfg BenchmarkConfig) *BenchmarkResult
 	return &BenchmarkResult{Name: "Pebble (SyncFull)"}
 }
 
-// ======================== Core Benchmark Runner ========================
+// Core Benchmark Runner
 
 type localSample struct{ data []int64 }
 
@@ -660,7 +660,7 @@ func runBenchmarkWithRecovery(t *testing.T, node *dpx.Node, name string, cfg Ben
 	return result
 }
 
-// ======================== Test Functions ========================
+// Test Functions
 
 // TestStorageComparison runs the full comparison benchmark.
 // Run with: go test ./tests/ -run TestStorageComparison -v -timeout 600s

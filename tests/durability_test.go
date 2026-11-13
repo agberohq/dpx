@@ -560,8 +560,6 @@ func TestConcurrentCrashDurability(t *testing.T) {
 				}
 			}
 
-			// Total should equal the number of successful writes
-			// (some writes may have been in-flight at crash time)
 			t.Logf("Concurrent crash: %s | Recovery: %s | Successes: %d | Total balance: %d | Bytes/tx: %.1f",
 				tc.name, recoveryTime, successes.Load(), total, float64(bd.TotalSize)/float64(successes.Load()))
 

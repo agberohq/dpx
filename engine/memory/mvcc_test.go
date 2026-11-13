@@ -324,8 +324,6 @@ func TestMVCC_MultiKeySnapshot(t *testing.T) {
 				}
 				snap.Close()
 
-				// Within a snapshot, values updated in the same batch should be equal
-				// (since they share the same commit sequence)
 				for k := 1; k < 10; k++ {
 					// This is a best-effort check: if two wallets were updated in the
 					// same batch, they should have the same value in any snapshot
