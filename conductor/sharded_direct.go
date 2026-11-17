@@ -157,28 +157,15 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 
 	idx := sp.index.Add(1)
 
-	// Conflict detection
+	// Conflict detection: every read must still be at the epoch it saw.
+	// No stack shadow here — one proposal is applied at a time under
+	// epochMu, so there is no intra-batch shadow to check.
 	conflict := false
-	if len(p.ReadSet) <= maxStackShadow {
-		var stackShadow [maxStackShadow]shadowEntry
-		shadowLen := 0
-
-		for _, re := range p.ReadSet {
-			k := unsafe.String(unsafe.SliceData(re.Key), len(re.Key))
-			if c := sp.fsm.state.keyEpoch[k]; c.Epoch > re.Epoch {
-				if !(c.IsCredit && re.IsDebit) {
-					conflict = true
-					break
-				}
-			}
-			for j := 0; j < shadowLen; j++ {
-				if stackShadow[j].key == k {
-					if !(stackShadow[j].epoch.IsCredit && re.IsDebit) {
-						conflict = true
-					}
-					break
-				}
-			}
+	for _, re := range p.ReadSet {
+		k := unsafe.String(unsafe.SliceData(re.Key), len(re.Key))
+		if c := sp.fsm.state.keyEpoch[k]; c.Epoch > re.Epoch && (!c.IsCredit || !re.IsDebit) {
+			conflict = true
+			break
 		}
 	}
 
