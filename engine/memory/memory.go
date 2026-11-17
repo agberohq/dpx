@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -57,8 +58,15 @@ type shardState struct {
 // Engine is the in-memory StorageEngine.
 // Sharded mode partitions keys across 64 shards for parallel writes.
 type Engine struct {
-	sharded   bool
-	shards    [numShards]shardState
+	sharded bool
+	shards  [numShards]shardState
+	// commitSeq is a seqlock over multi-shard commits: odd while a commit is
+	// publishing shard states, even when none is. Each shard swaps its state
+	// on its own, so a snapshot can load some shards before a commit and
+	// others after, and a transaction validated on that mixed view passes
+	// conflict detection on stale data. commitMu keeps writers exclusive.
+	commitSeq atomic.Uint64
+	commitMu  sync.Mutex
 	cur       atomic.Pointer[state] // legacy non-sharded path
 	mu        sync.Mutex            // legacy non-sharded path
 	dir       string
@@ -156,10 +164,20 @@ func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
 			states:    make([]*state, numShards),
 			telemetry: e.telemetry,
 		}
-		for i := range e.shards {
-			snap.states[i] = e.shards[i].cur.Load()
+		// Every shard must be loaded with no commit landing in between.
+		for {
+			before := e.commitSeq.Load()
+			if before&1 == 1 {
+				runtime.Gosched()
+				continue
+			}
+			for i := range e.shards {
+				snap.states[i] = e.shards[i].cur.Load()
+			}
+			if e.commitSeq.Load() == before {
+				return snap, nil
+			}
 		}
-		return snap, nil
 	}
 	return &memSnapshot{s: e.cur.Load(), telemetry: e.telemetry}, nil
 }
@@ -175,6 +193,12 @@ func (e *Engine) NewBatch() engine.Batch {
 // The caller must hold the shard's CAS lock (not the engine's mutex).
 // This is the fast path used by the sharded proposer's applyInline.
 func (e *Engine) ApplyShardDirect(shardIdx int, writes []WriteOp, applied uint64) {
+	e.commitMu.Lock()
+	e.commitSeq.Add(1)
+	defer func() {
+		e.commitSeq.Add(1)
+		e.commitMu.Unlock()
+	}()
 	sh := &e.shards[shardIdx]
 	sh.mu.Lock()
 	cur := sh.cur.Load()
@@ -285,6 +309,14 @@ func (e *Engine) applyBatchSharded(b engine.Batch) error {
 		shardIds = append(shardIds, s)
 	}
 	sort.Ints(shardIds)
+
+	// Publish all shards of this batch as one step for snapshots; see commitSeq.
+	e.commitMu.Lock()
+	e.commitSeq.Add(1)
+	defer func() {
+		e.commitSeq.Add(1)
+		e.commitMu.Unlock()
+	}()
 
 	for _, s := range shardIds {
 		sh := &e.shards[s]
