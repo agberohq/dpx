@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/agberohq/dpx/engine"
+	"github.com/agberohq/dpx/engine/memory"
 	"github.com/agberohq/dpx/shared"
 	hraft "github.com/hashicorp/raft"
 	"github.com/olekukonko/hlc"
@@ -73,6 +74,7 @@ type dpxFSM struct {
 	clock      *hlc.Clock
 	pool       sync.Pool
 	vkBufPool  sync.Pool
+	wopPool    sync.Pool // *[]memory.MVCCWriteOp, reused per sharded proposal
 	watchers   shared.WatchNotifier
 	metrics    *shared.Metrics
 	telemetry  *shared.Telemetry
@@ -101,6 +103,12 @@ func newFSM(
 		},
 		vkBufPool: sync.Pool{
 			New: func() any { return make([]byte, 0, 256) },
+		},
+		wopPool: sync.Pool{
+			New: func() any {
+				ops := make([]memory.MVCCWriteOp, 0, 64)
+				return &ops
+			},
 		},
 	}
 }

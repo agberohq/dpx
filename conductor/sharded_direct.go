@@ -2,8 +2,6 @@ package conductor
 
 import (
 	"errors"
-	"runtime"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -15,18 +13,16 @@ import (
 
 var errShardedClosed = errors.New("dpx/raft: sharded proposer closed")
 
-// shardedDirectProposer routes proposals to 64 independent shards.
-// Each shard applies proposals inline via applyInline — no submit channel,
-// no applierLoop goroutine, no flush ticker, no result channel allocation.
+// shardedDirectProposer applies proposals inline — no submit channel, no
+// applierLoop goroutine, no flush ticker, no result channel allocation.
 //
-// With 2048 goroutines / 64 shards = 32 goroutines/shard, each shard's
-// CAS spinlock serializes access. The inline path eliminates all channel
-// overhead, reducing per-proposal latency from ~9ms to ~150µs.
+// Concurrency comes from the striped conflict table: a proposal holds the
+// stripes for the keys it reads and writes, so proposals over disjoint keys
+// commit in parallel.
 type shardedDirectProposer struct {
-	shards   [numShards]*shardProposer
-	closed   atomic.Bool
-	epochMu  sync.Mutex                    // serializes conflict-check + apply across shards
-	keyEpoch map[string]engine.EpochRecord // SHARED conflict map (global, not per-proposer)
+	shards    [numShards]*shardProposer
+	closed    atomic.Bool
+	conflicts *conflictTable // striped key→epoch table shared by all shards
 }
 
 // numShards must match engine/memory.numShards.
@@ -36,11 +32,10 @@ const numShards = 128
 
 // shardProposer is a single shard's inline proposer.
 type shardProposer struct {
-	fsm      *dpxFSM
-	index    *atomic.Uint64 // SHARED across all shards: epochs must be globally monotonic
-	mu       atomic.Uint32  // used as a spinlock for serial access
-	shardIdx int            // shard index for routing
-	owner    *shardedDirectProposer
+	fsm       *dpxFSM
+	index     *atomic.Uint64 // SHARED across all shards: epochs must be globally monotonic
+	shardIdx  int            // shard index for routing
+	conflicts *conflictTable
 }
 
 func newShardedDirectProposer(
@@ -50,30 +45,30 @@ func newShardedDirectProposer(
 	metrics *shared.Metrics,
 	telemetry *shared.Telemetry,
 ) (*shardedDirectProposer, error) {
-	s := &shardedDirectProposer{}
-	// One epoch counter for every shard. Version records store this value and
-	// detectConflict compares it against keyEpoch; if each shard kept its own
-	// counter, a key written by a "low-count" shard after being written by a
-	// "high-count" shard would get a SMALLER epoch than the stale keyEpoch,
-	// producing permanent false conflicts on retry.
+	s := &shardedDirectProposer{conflicts: newConflictTable()}
+	// One epoch counter for every shard. Epoch records stay comparable across
+	// stripes only if a single counter issues them; a per-shard counter would
+	// let a "low-count" shard stamp a key with a smaller epoch than the stale
+	// record, producing permanent false conflicts on retry.
 	globalIndex := &atomic.Uint64{}
-	s.keyEpoch = make(map[string]engine.EpochRecord, 1<<16)
 	for i := range s.shards {
 		clock := hlc.NewClock()
 		f := newFSM(eng, syncPolicy, w, metrics, clock)
 		f.skipHLC = true
-		if _, err := f.open(nil); err != nil {
-			return nil, err
+		if i == 0 {
+			// Hydrate the shared conflict table once from the engine's
+			// version records, not once per shard.
+			if _, err := f.open(nil); err != nil {
+				return nil, err
+			}
+			s.conflicts.hydrate(f.state.keyEpoch)
 		}
-		// Every shard shares ONE conflict map. A per-shard map makes writes
-		// applied by another shard invisible, so cross-shard conflicts are
-		// never detected (lost updates, forked chains).
-		f.state.keyEpoch = s.keyEpoch
+		f.state.keyEpoch = nil
 		s.shards[i] = &shardProposer{
-			fsm:      f,
-			index:    globalIndex,
-			shardIdx: i,
-			owner:    s,
+			fsm:       f,
+			index:     globalIndex,
+			shardIdx:  i,
+			conflicts: s.conflicts,
 		}
 	}
 	return s, nil
@@ -128,42 +123,41 @@ func (s *shardedDirectProposer) Shutdown() error {
 	return nil
 }
 
-// applyInline applies a single proposal synchronously on this shard.
-// Uses CAS-based locking to serialize access without a mutex.
-func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
-	// CAS-based spinlock with exponential backoff.
-	// Tight spin for first few attempts (lock holder likely finishing soon),
-	// then yield to avoid wasting CPU when contention is high.
-	retries := 0
-	for !sp.mu.CompareAndSwap(0, 1) {
-		if retries < 4 {
-			retries++
-		} else {
-			runtime.Gosched()
-			retries = 0
+// sortOpsByShard orders ops by engine shard so ApplySortedDirect can take one
+// lock per contiguous run. Insertion sort: a proposal carries tens of ops, well
+// below the size where sort.Slice's closure and interface overhead pays off.
+func sortOpsByShard(ops []memory.MVCCWriteOp) {
+	for i := 1; i < len(ops); i++ {
+		v := ops[i]
+		j := i - 1
+		for j >= 0 && ops[j].Shard > v.Shard {
+			ops[j+1] = ops[j]
+			j--
 		}
+		ops[j+1] = v
 	}
-	defer sp.mu.Store(0)
+}
 
-	// Conflict detection and application must be atomic with respect to ALL
-	// shards, because the conflict map is global: another shard may write a
-	// key this proposal read. Without this lock two proposals can both observe
-	// an absent key and both create it (check-then-create race).
-	owner := sp.owner
-	if owner != nil {
-		owner.epochMu.Lock()
-		defer owner.epochMu.Unlock()
-	}
+// applyInline applies a single proposal synchronously on this shard.
+//
+// The proposal holds the conflict stripes for every key it reads or writes for
+// the whole check-then-apply window. Proposals with disjoint keys run in
+// parallel; proposals sharing a key serialize on that key's stripe.
+func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
+	var lbuf [32]uint32
+	lockIDs := sp.conflicts.lockFor(p, lbuf[:0])
+	sp.conflicts.lock(lockIDs)
+	defer sp.conflicts.unlock(lockIDs)
 
 	idx := sp.index.Add(1)
 
 	// Conflict detection: every read must still be at the epoch it saw.
-	// No stack shadow here — one proposal is applied at a time under
-	// epochMu, so there is no intra-batch shadow to check.
+	// No stack shadow is needed: any proposal that could change a key in this
+	// read set would have to hold that key's stripe, which we hold.
 	conflict := false
 	for _, re := range p.ReadSet {
 		k := unsafe.String(unsafe.SliceData(re.Key), len(re.Key))
-		if c := sp.fsm.state.keyEpoch[k]; c.Epoch > re.Epoch && (!c.IsCredit || !re.IsDebit) {
+		if c := sp.conflicts.get(conflictStripeFor(re.Key), k); c.Epoch > re.Epoch && (!c.IsCredit || !re.IsDebit) {
 			conflict = true
 			break
 		}
@@ -178,66 +172,63 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 
 	// Apply to engine — use lock-free path for MVCC engine when possible
 	if mvccEng, ok := sp.fsm.engine.(*memory.MVCCEngine); ok && mvccEng.IsSharded() {
-		// MVCC lock-free path: skip RWMutex since CAS spinlock already serializes
+		// MVCC path: the engine's per-shard locks plus the striped conflict
+		// locks above are the only serialization; there is no engine-wide
+		// commit mutex, so disjoint proposals apply in parallel.
 		vkBuf := sp.fsm.vkBufPool.Get().([]byte)
 		defer sp.fsm.vkBufPool.Put(vkBuf)
 
-		var epochBuf [9]byte
-		// Route every write to the ENGINE shard that readers will use for
-		// that key. GetVersion looks up "__dpx:ver:<userKey>" in
-		// engine/memory.shardFor(versionKey) — the version key MUST land in
-		// that same shard, otherwise debit read-sets hydrate epoch 0 while
-		// this shard's keyEpoch holds the real epoch, producing permanent
-		// ErrConflictExhausted on second debits of the same key. User keys
-		// are routed by their own hash; point/range reads use shardFor(key)
-		// directly, so user data and version data are both consistent per
-		// key. Each key group is applied to its own engine shard under the
-		// proposal's single CAS-serialized inline path.
-		type shardGroup struct {
-			user []memory.MVCCWriteOp
-			ver  []memory.MVCCWriteOp
-		}
-		groups := make(map[int][]memory.MVCCWriteOp, len(p.Writes)+1)
-		groupFor := func(sh int) []memory.MVCCWriteOp {
-			g, ok := groups[sh]
-			if !ok {
-				g = make([]memory.MVCCWriteOp, 0, len(p.Writes)+2)
-				groups[sh] = g
-			}
-			return g
-		}
-		for _, w := range p.Writes {
+		// Version records are stored by reference by the engine, so every op
+		// needs its own bytes. Reusing one scratch array made every version
+		// record in a transaction carry the last key's IsCredit flag.
+		verBuf := make([]byte, 9*len(p.Writes))
+
+		opsPtr := sp.fsm.wopPool.Get().(*[]memory.MVCCWriteOp)
+		ops := (*opsPtr)[:0]
+		defer func() {
+			*opsPtr = ops[:0]
+			sp.fsm.wopPool.Put(opsPtr)
+		}()
+
+		var appliedBuf [8]byte
+		for i, w := range p.Writes {
 			isCredit := w.Op == shared.OpCredit
-			sh := memory.EngineShardFor(string(w.Key))
+			keyStr := string(w.Key)
+			code := byte('s')
 			switch w.Op {
 			case shared.OpSet:
-				groups[sh] = append(groupFor(sh),
-					memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 's'})
+				code = 's'
 			case shared.OpDelete:
-				groups[sh] = append(groupFor(sh),
-					memory.MVCCWriteOp{Key: string(w.Key), Op: 'd'})
+				code = 'd'
 			case shared.OpCredit, shared.OpDebit:
-				groups[sh] = append(groupFor(sh),
-					memory.MVCCWriteOp{Key: string(w.Key), Value: w.Value, Op: 'm'})
+				code = 'm'
 			}
+			ops = append(ops, memory.MVCCWriteOp{
+				Key: keyStr, Value: w.Value, Op: code,
+				Shard: memory.EngineShardFor(keyStr),
+			})
+
 			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
 			vk := string(versionKey(vkBuf, w.Key))
-			vsh := memory.EngineShardFor(vk)
-			groups[vsh] = append(groupFor(vsh),
-				memory.MVCCWriteOp{Key: vk, Value: encodeEpochRecord(er, epochBuf[:]), Op: 's'})
-			sp.fsm.state.keyEpoch[string(w.Key)] = er
+			seg := verBuf[i*9 : (i+1)*9]
+			ops = append(ops, memory.MVCCWriteOp{
+				Key: vk, Value: encodeEpochRecord(er, seg), Op: 's',
+				Shard: memory.EngineShardFor(vk),
+			})
+			sp.conflicts.set(conflictStripeFor(w.Key), keyStr, er)
 		}
 		{
 			vk := string(appliedKey)
-			sh := memory.EngineShardFor(vk)
-			groups[sh] = append(groupFor(sh), memory.MVCCWriteOp{
+			ops = append(ops, memory.MVCCWriteOp{
 				Key:   vk,
-				Value: encodeUint64(idx, epochBuf[:8]),
+				Value: encodeUint64(idx, appliedBuf[:]),
 				Op:    's',
+				Shard: memory.EngineShardFor(vk),
 			})
 		}
 
-		commitSeq := mvccEng.ApplyShardsDirect(groups)
+		sortOpsByShard(ops)
+		commitSeq := mvccEng.ApplySortedDirect(ops)
 		sp.fsm.applied.Store(commitSeq)
 	} else {
 		// Fallback: standard ApplyBatch path for non-MVCC engines
@@ -260,7 +251,7 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 			}
 			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
 			engBatch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
-			sp.fsm.state.keyEpoch[string(w.Key)] = er
+			sp.conflicts.set(conflictStripeFor(w.Key), string(w.Key), er)
 		}
 		engBatch.Set(appliedKey, encodeUint64(idx, appliedBuf[:]))
 
