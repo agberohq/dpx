@@ -24,6 +24,7 @@ const dpxBucket = "__dpx"
 type Engine struct {
 	db        *oshodi.DB
 	dir       string
+	opts      []oshodi.Option
 	bucket    *oshodi.Bucket
 	mu        sync.Mutex // protects snapshot materialization
 	seq       uint64
@@ -32,8 +33,14 @@ type Engine struct {
 
 // New creates an Oshodi engine that stores data in dir.
 // Open must be called before any reads or writes.
-func New(dir string) *Engine {
-	return &Engine{dir: dir}
+//
+// Options are passed straight through to oshodi.Open. Without them Oshodi
+// runs on its defaults (WAL disabled, write coalescing off, 64 shards,
+// 10k-entry cache), which is a correctness baseline rather than a tuned
+// configuration. Use this to select coalescing, WAL durability, shard count,
+// cache size, batching and compaction settings.
+func New(dir string, opts ...oshodi.Option) *Engine {
+	return &Engine{dir: dir, opts: opts}
 }
 
 // SetTelemetry optionally provides a StageRecorder for internal timing.
@@ -47,7 +54,7 @@ func (e *Engine) Open() error {
 		return err
 	}
 	path := filepath.Join(e.dir, "oshodi.db")
-	db, err := oshodi.Open(path)
+	db, err := oshodi.Open(path, e.opts...)
 	if err != nil {
 		return fmt.Errorf("oshodi open: %w", err)
 	}
@@ -117,35 +124,55 @@ func (e *Engine) NewBatch() engine.Batch {
 	return &oshodiBatch{}
 }
 
-// ApplyBatch applies all mutations in batch atomically.
+// ApplyBatch applies all mutations in batch.
+//
+// Sets and merges are coalesced into a single Bucket.BatchSet call, so a
+// transaction costs one pipeline submission instead of one per key. Merges are
+// resolved first because they need the current value. Deletes still go one at
+// a time: the pinned oshodi release has no BatchDelete.
+//
+// BatchSet is per-entry, not transactional: a failure part-way leaves the
+// earlier entries applied, same as the previous per-key loop.
 func (e *Engine) ApplyBatch(batch engine.Batch, opts engine.WriteOptions) error {
 	ob := batch.(*oshodiBatch)
+
+	sets := make([]oshodi.KV, 0, len(ob.ops))
+	var deletes [][]byte
+	var appliedSeq uint64
+	isApplied := false
 
 	for _, op := range ob.ops {
 		switch op.op {
 		case 's':
-			if err := e.bucket.Set(op.key, op.value); err != nil {
-				return err
-			}
+			sets = append(sets, oshodi.KV{Key: op.key, Value: op.value})
 			if string(op.key) == "__dpx:applied" && len(op.value) >= 8 {
-				e.seq = binary.LittleEndian.Uint64(op.value)
+				appliedSeq = binary.LittleEndian.Uint64(op.value)
+				isApplied = true
 			}
 		case 'd':
-			if err := e.bucket.Delete(op.key); err != nil {
-				return err
-			}
+			deletes = append(deletes, op.key)
 		case 'm':
-			// Merge: read current value, add delta, write back.
 			cur, err := e.bucket.Get(op.key)
 			if err != nil && err != oshodi.ErrKeyNotFound {
 				return err
 			}
 			sum := decodeInt64(cur) + decodeInt64(op.value)
-			val := encodeInt64(sum)
-			if err := e.bucket.Set(op.key, val); err != nil {
-				return err
-			}
+			sets = append(sets, oshodi.KV{Key: op.key, Value: encodeInt64(sum)})
 		}
+	}
+
+	if len(sets) > 0 {
+		if err := e.bucket.BatchSet(sets); err != nil {
+			return err
+		}
+	}
+	for _, key := range deletes {
+		if err := e.bucket.Delete(key); err != nil {
+			return err
+		}
+	}
+	if isApplied {
+		e.seq = appliedSeq
 	}
 
 	if opts.Sync {

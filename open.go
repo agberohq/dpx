@@ -9,6 +9,7 @@ import (
 	"github.com/agberohq/dpx/engine/memory"
 	"github.com/agberohq/dpx/engine/oshodi"
 	"github.com/agberohq/dpx/engine/pebble"
+	oshodidb "github.com/agberohq/oshodi"
 )
 
 // OpenEmbedded opens a single-shard in-memory DPX node.
@@ -23,12 +24,14 @@ func OpenEmbedded(cfg Config) (*Node, error) {
 	return Open(cfg, conductor.Open)
 }
 
-// OpenSharded opens a 64-shard in-memory DPX node.
-// Provides higher write throughput than OpenEmbedded by parallelising
-// conflict detection across 64 independent shards. Data is lost on Close().
+// OpenSharded opens a 128-shard copy-on-write btree in-memory DPX node.
+// Data is lost on Close().
 //
-// Use for high-concurrency embedded workloads (e.g. Teller production with
-// the memory engine).
+// Compatibility engine. Every apply in this engine takes a single commit mutex
+// because snapshots are published with a seqlock over one commit counter, so
+// throughput does not improve with concurrency: the striped proposer parallelises
+// the proposal path, then all writers queue on the engine's commit lock. Prefer
+// OpenConcurrent (MVCC) for write-concurrent workloads.
 //
 // Example:
 //
@@ -38,17 +41,33 @@ func OpenSharded(cfg Config) (*Node, error) {
 	return Open(cfg, conductor.Open)
 }
 
-// OpenMVCCSharded opens a 64-shard MVCC in-memory DPX node.
+// OpenConcurrent opens the recommended in-memory engine for write-concurrent
+// workloads: sharded MVCC.
+//
+// Transactions that touch disjoint keys commit in parallel — the proposer holds
+// only per-key conflict stripes, and the MVCC engine has no engine-wide commit
+// mutex: commits reserve a sequence range and publish it atomically once every
+// shard is written, so readers never observe a half-applied transaction.
+//
+// Data is lost on Close().
+//
+// Example:
+//
+//	node, err := dpx.OpenConcurrent(dpx.Config{})
+func OpenConcurrent(cfg Config) (*Node, error) {
+	return OpenMVCCSharded(cfg)
+}
+
+// OpenMVCCSharded opens a 128-shard MVCC in-memory DPX node.
 // MVCC (Multi-Version Concurrency Control) eliminates COW tree cloning by
 // storing versioned entries in hash maps. Snapshot creation is O(1) — just
 // reading a sequence counter — with no allocations.
 //
 // Commit protocol:
-// Each ApplyBatch assigns a single commit sequence for all keys in the batch.
-// All entries share the same sequence, so a snapshot can never see only part
-// of a transaction — atomic visibility is guaranteed. A lastCommitted counter
-// ensures snapshots only see fully-written batches, preventing snapshot isolation
-// violations under concurrent writes.
+// Each batch reserves a contiguous sequence range. All entries share the same
+// sequence, so a snapshot can never see only part of a transaction. The range
+// is published only once every shard has been written, so concurrent appliers
+// cannot expose a half-written batch.
 //
 // Compaction:
 // A background goroutine runs every 100ms to reclaim old versions. Compaction
@@ -95,10 +114,10 @@ func OpenPebble(cfg Config) (*Node, error) {
 // Example:
 //
 //	node, err := dpx.OpenOshodi(dpx.Config{DataDir: "/var/lib/teller/dpx"})
-func OpenOshodi(cfg Config) (*Node, error) {
+func OpenOshodi(cfg Config, opts ...oshodidb.Option) (*Node, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/tmp/dpx-oshodi"
 	}
-	cfg.Engine = oshodi.New(cfg.DataDir)
+	cfg.Engine = oshodi.New(cfg.DataDir, opts...)
 	return Open(cfg, conductor.Open)
 }
