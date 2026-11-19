@@ -190,13 +190,12 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 			sp.fsm.wopPool.Put(opsPtr)
 		}()
 
-		var appliedBuf [8]byte
 		for i, w := range p.Writes {
 			isCredit := w.Op == shared.OpCredit
 			keyStr := string(w.Key)
 			code := byte('s')
 			switch w.Op {
-			case shared.OpSet:
+			case shared.OpSet, shared.OpSetAppend:
 				code = 's'
 			case shared.OpDelete:
 				code = 'd'
@@ -209,23 +208,23 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 			})
 
 			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
-			vk := string(versionKey(vkBuf, w.Key))
-			seg := verBuf[i*9 : (i+1)*9]
-			ops = append(ops, memory.MVCCWriteOp{
-				Key: vk, Value: encodeEpochRecord(er, seg), Op: 's',
-				Shard: memory.EngineShardFor(vk),
-			})
+			// Append-only keys skip the version record (one engine write), but
+			// still enter the epoch map: a future Get of the key must conflict
+			// against this write rather than miss it.
+			if w.Op != shared.OpSetAppend {
+				vk := string(versionKey(vkBuf, w.Key))
+				seg := verBuf[i*9 : (i+1)*9]
+				ops = append(ops, memory.MVCCWriteOp{
+					Key: vk, Value: encodeEpochRecord(er, seg), Op: 's',
+					Shard: memory.EngineShardFor(vk),
+				})
+			}
 			sp.conflicts.set(conflictStripeFor(w.Key), keyStr, er)
 		}
-		{
-			vk := string(appliedKey)
-			ops = append(ops, memory.MVCCWriteOp{
-				Key:   vk,
-				Value: encodeUint64(idx, appliedBuf[:]),
-				Op:    's',
-				Shard: memory.EngineShardFor(vk),
-			})
-		}
+		// No __dpx:applied write on this path. The MVCC engine tracks its commit
+		// sequence in seqCounter (CurrentSequence and GetSafeReadPoint both use
+		// it), so the marker has no reader here — and writing one shared key from
+		// every transaction serialises all appliers on that key's engine shard.
 
 		sortOpsByShard(ops)
 		commitSeq := mvccEng.ApplySortedDirect(ops)
@@ -242,7 +241,7 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 		for _, w := range p.Writes {
 			isCredit := w.Op == shared.OpCredit
 			switch w.Op {
-			case shared.OpSet:
+			case shared.OpSet, shared.OpSetAppend:
 				engBatch.Set(w.Key, w.Value)
 			case shared.OpDelete:
 				engBatch.Delete(w.Key)
@@ -250,7 +249,9 @@ func (sp *shardProposer) applyInline(p *shared.Proposal) shared.ApplyResult {
 				engBatch.Merge(w.Key, w.Value)
 			}
 			er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
-			engBatch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+			if w.Op != shared.OpSetAppend {
+				engBatch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+			}
 			sp.conflicts.set(conflictStripeFor(w.Key), string(w.Key), er)
 		}
 		engBatch.Set(appliedKey, encodeUint64(idx, appliedBuf[:]))

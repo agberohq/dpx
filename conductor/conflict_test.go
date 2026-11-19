@@ -250,3 +250,46 @@ func TestApplySortedDirectKeepsVersionRecordsDistinct(t *testing.T) {
 		t.Fatalf("beta version = %+v, want {%d false}", got2, epoch)
 	}
 }
+
+// TestAppendOnlyWritesSkipVersionRecords checks that OpSetAppend writes the
+// value but leaves no epoch record, while a normal Set still writes both.
+func TestAppendOnlyWritesSkipVersionRecords(t *testing.T) {
+	eng := memory.NewMVCCSharded()
+	if err := eng.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	plain := []byte("plain-key")
+	appendOnly := []byte("append-key")
+	verBuf := make([]byte, 9*2)
+
+	ops := []memory.MVCCWriteOp{
+		{Key: string(plain), Value: []byte("v1"), Op: 's', Shard: memory.EngineShardFor(string(plain))},
+		{Key: string(versionKey(nil, plain)), Value: encodeEpochRecord(engine.EpochRecord{Epoch: 3}, verBuf[0:9]),
+			Op: 's', Shard: memory.EngineShardFor(string(versionKey(nil, plain)))},
+		{Key: string(appendOnly), Value: []byte("v2"), Op: 's', Shard: memory.EngineShardFor(string(appendOnly))},
+	}
+	sortOpsByShard(ops)
+	eng.ApplySortedDirect(ops)
+
+	snap, err := eng.GetSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+
+	if got, err := snap.GetVersion(plain); err != nil || got.Epoch != 3 {
+		t.Fatalf("plain epoch = %+v, %v", got, err)
+	}
+	er, err := snap.GetVersion(appendOnly)
+	if err != nil {
+		t.Fatalf("append-only version: %v", err)
+	}
+	if er.Epoch != 0 {
+		t.Fatalf("append-only key has a version record (epoch %d); it should have none", er.Epoch)
+	}
+	if v, err := snap.Get(appendOnly); err != nil || string(v) != "v2" {
+		t.Fatalf("append-only value = %q, %v", v, err)
+	}
+}

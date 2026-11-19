@@ -61,6 +61,17 @@ const (
 	OpDelete WriteOp = 2
 	OpCredit WriteOp = 3
 	OpDebit  WriteOp = 4
+	// OpSetAppend writes the value without recording its __dpx:ver: epoch.
+	//
+	// The version record exists so a later reader can learn the key's epoch and
+	// start its conflict window from there. For a key that is only ever appended
+	// to and read back through range scans (which do not join the read set), the
+	// record is pure write amplification: it is one extra engine write per key.
+	//
+	// CONTRACT: a key written with OpSetAppend must never be read with Get or
+	// AtomicAdd. A reader would baseline at epoch 0 and conflict against the
+	// key's live epoch forever. Range scans are fine.
+	OpSetAppend WriteOp = 5
 )
 
 const (

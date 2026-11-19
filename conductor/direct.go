@@ -226,8 +226,6 @@ func (d *directProposer) applierLoop() {
 		if d.fsm.telemetry != nil {
 			d.fsm.telemetry.DirectAccumulate.Record(time.Since(batch[0].accStart))
 		}
-		// Inline path: conflict detection + commit + notify in one call.
-		// No preparedBatch, no channel, no second goroutine.
 		d.applyBatchDirect(batch)
 		for i := range batch {
 			batch[i] = nil
@@ -328,7 +326,7 @@ func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 			for _, w := range entry.p.Writes {
 				isCredit := w.Op == shared.OpCredit
 				switch w.Op {
-				case shared.OpSet:
+				case shared.OpSet, shared.OpSetAppend:
 					engBatch.Set(w.Key, w.Value)
 				case shared.OpDelete:
 					engBatch.Delete(w.Key)
@@ -336,7 +334,9 @@ func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 					engBatch.Merge(w.Key, w.Value)
 				}
 				er := engine.EpochRecord{Epoch: idx, IsCredit: isCredit}
-				engBatch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+				if w.Op != shared.OpSetAppend {
+					engBatch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+				}
 				if shadowLen < maxStackShadow {
 					stackShadow[shadowLen] = shadowEntry{
 						key:   unsafe.String(unsafe.SliceData(w.Key), len(w.Key)),
@@ -402,6 +402,11 @@ func (d *directProposer) applyBatchDirect(entries []*proposalEntry) {
 		}
 	}
 
+	d.deliverResults(entries, results)
+}
+
+// deliverResults notifies watchers and wakes the waiting callers.
+func (d *directProposer) deliverResults(entries []*proposalEntry, results []shared.ApplyResult) {
 	for i, entry := range entries {
 		if results[i].Err == nil && !results[i].Conflict && d.fsm.watchers != nil {
 			d.fsm.watchers.NotifyBatch(entry.p.Writes, d.fsm.metrics)

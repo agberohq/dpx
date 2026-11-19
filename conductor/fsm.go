@@ -249,7 +249,7 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow m
 	for _, w := range proposal.Writes {
 		isCredit := w.Op == shared.OpCredit
 		switch w.Op {
-		case shared.OpSet:
+		case shared.OpSet, shared.OpSetAppend:
 			batch.Set(w.Key, w.Value)
 		case shared.OpDelete:
 			batch.Delete(w.Key)
@@ -260,7 +260,9 @@ func (f *dpxFSM) applyProposal(index uint64, proposal *shared.Proposal, shadow m
 		}
 
 		er := engine.EpochRecord{Epoch: index, IsCredit: isCredit}
-		batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+		if w.Op != shared.OpSetAppend {
+			batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+		}
 		shadow[unsafe.String(unsafe.SliceData(w.Key), len(w.Key))] = er
 		f.state.keyEpoch[string(w.Key)] = er
 	}
@@ -305,7 +307,7 @@ func (f *dpxFSM) applyProposalToBatch(index uint64, proposal *shared.Proposal, s
 	for _, w := range proposal.Writes {
 		isCredit := w.Op == shared.OpCredit
 		switch w.Op {
-		case shared.OpSet:
+		case shared.OpSet, shared.OpSetAppend:
 			batch.Set(w.Key, w.Value)
 		case shared.OpDelete:
 			batch.Delete(w.Key)
@@ -316,7 +318,9 @@ func (f *dpxFSM) applyProposalToBatch(index uint64, proposal *shared.Proposal, s
 		}
 
 		er := engine.EpochRecord{Epoch: index, IsCredit: isCredit}
-		batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+		if w.Op != shared.OpSetAppend {
+			batch.Set(versionKey(vkBuf, w.Key), encodeEpochRecord(er, epochBuf[:]))
+		}
 		shadow[unsafe.String(unsafe.SliceData(w.Key), len(w.Key))] = er
 		f.state.keyEpoch[string(w.Key)] = er
 	}

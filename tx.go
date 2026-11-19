@@ -69,6 +69,59 @@ func snapshotValue(snap engine.Snapshot, key []byte) ([]byte, error) {
 	return snap.Get(key)
 }
 
+// AppendOnlyWriter is an optional KVTx capability. SetAppendOnly writes a value
+// without recording its conflict epoch: one engine write instead of two.
+//
+// CONTRACT: the key must never be read back with Get or AtomicAdd. Reads would
+// baseline at epoch 0 and conflict against the key's live epoch indefinitely.
+// Range scans are safe; they do not join the read set. See shared.OpSetAppend.
+type AppendOnlyWriter interface {
+	SetAppendOnly(ctx context.Context, key, value []byte) error
+}
+
+// OwnedWriter is an optional KVTx capability: SetOwned and SetAppendOnlyOwned
+// take ownership of key and value instead of copying them.
+//
+// The caller must not modify or reuse either buffer after the call: the
+// proposal holds them until the transaction commits. Use it when the buffers
+// are freshly allocated (a marshalled record, a key built for this write);
+// Set/SetAppendOnly copy and are safe for reused scratch buffers.
+type OwnedWriter interface {
+	SetOwned(ctx context.Context, key, value []byte) error
+	SetAppendOnlyOwned(ctx context.Context, key, value []byte) error
+}
+
+// SetOwned buffers a plain write without copying key or value.
+func (tx *dpxTx) SetOwned(ctx context.Context, key, value []byte) error {
+	if isReserved(key) {
+		return ErrReservedKey
+	}
+	tx.writes = append(tx.writes, shared.WriteEntry{Op: shared.OpSet, Key: key, Value: value})
+	return nil
+}
+
+// SetAppendOnlyOwned buffers an append-only write without copying key or value.
+func (tx *dpxTx) SetAppendOnlyOwned(ctx context.Context, key, value []byte) error {
+	if isReserved(key) {
+		return ErrReservedKey
+	}
+	tx.writes = append(tx.writes, shared.WriteEntry{Op: shared.OpSetAppend, Key: key, Value: value})
+	return nil
+}
+
+// SetAppendOnly buffers a write that will not get a __dpx:ver: record.
+func (tx *dpxTx) SetAppendOnly(ctx context.Context, key, value []byte) error {
+	if isReserved(key) {
+		return ErrReservedKey
+	}
+	cpKey := make([]byte, len(key))
+	copy(cpKey, key)
+	cpVal := make([]byte, len(value))
+	copy(cpVal, value)
+	tx.writes = append(tx.writes, shared.WriteEntry{Op: shared.OpSetAppend, Key: cpKey, Value: cpVal})
+	return nil
+}
+
 // Set buffers a plain write.
 func (tx *dpxTx) Set(ctx context.Context, key, value []byte) error {
 	if isReserved(key) {
