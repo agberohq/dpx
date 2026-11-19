@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/agberohq/dpx/engine"
@@ -34,6 +35,11 @@ type Engine struct {
 	db        *badger.DB
 	dir       string
 	telemetry engine.StageRecorder
+	// applied mirrors the __dpx:applied record so snapshots do not need a
+	// Badger read transaction just to learn the sequence. Every transaction
+	// creates a snapshot, so the read transaction was on the hot path and
+	// contended on Badger's oracle lock at high concurrency.
+	applied atomic.Uint64
 }
 
 // New creates a Badger engine that stores data in dir.
@@ -59,7 +65,31 @@ func (e *Engine) Open() error {
 		return err
 	}
 	e.db = db
+	if seq, err := e.readApplied(); err == nil {
+		e.applied.Store(seq)
+	}
 	return nil
+}
+
+// readApplied loads the applied sequence once at Open time.
+func (e *Engine) readApplied() (uint64, error) {
+	var seq uint64
+	err := e.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("__dpx:applied"))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			if len(val) >= 8 {
+				seq = binary.LittleEndian.Uint64(val)
+			}
+			return nil
+		})
+	})
+	return seq, err
 }
 
 // Close flushes pending writes and releases all Badger resources.
@@ -104,7 +134,7 @@ func (e *Engine) NewBatch() engine.Batch {
 // Merge (AtomicAdd) is implemented as read-modify-write inside a single
 // Badger transaction. This is safe because ApplyBatch is only ever called
 // from the single-goroutine Raft state machine Update loop.
-func (e *Engine) ApplyBatch(batch engine.Batch, _ engine.WriteOptions) error {
+func (e *Engine) ApplyBatch(batch engine.Batch, opts engine.WriteOptions) error {
 	b := batch.(*badgerBatch)
 	txn := e.db.NewTransaction(true) // read-write
 	defer txn.Discard()
@@ -146,15 +176,26 @@ func (e *Engine) ApplyBatch(batch engine.Batch, _ engine.WriteOptions) error {
 		}
 	}
 
-	// Update applied sequence.
+	var appliedSeq uint64
 	for _, op := range b.ops {
 		if op.typ == opSet && op.key == "__dpx:applied" && len(op.value) >= 8 {
-			// Already written above via the Set loop.
-			break
+			appliedSeq = binary.LittleEndian.Uint64(op.value)
 		}
 	}
 
-	return txn.Commit()
+	if err := txn.Commit(); err != nil {
+		return err
+	}
+	if appliedSeq > e.applied.Load() {
+		e.applied.Store(appliedSeq)
+	}
+	// Badger has no per-transaction sync switch: durability is decided at Open
+	// (Options.SyncWrites) and by DB.Sync. Honour WriteOptions here so SyncFull
+	// actually fsyncs instead of silently behaving like SyncNone.
+	if opts.Sync {
+		return e.db.Sync()
+	}
+	return nil
 }
 
 // Sync flushes Badger's value log to disk.
@@ -162,14 +203,11 @@ func (e *Engine) Sync() error {
 	return e.db.Sync()
 }
 
-// CurrentSequence reads __dpx:applied from Badger.
-// Returns 0 on a fresh database.
+// CurrentSequence returns the last applied sequence.
+// Backed by an atomic mirror of __dpx:applied (loaded at Open, advanced on
+// commit), so it costs no Badger transaction.
 func (e *Engine) CurrentSequence() uint64 {
-	val, err := e.Get([]byte("__dpx:applied"))
-	if err != nil || len(val) < 8 {
-		return 0
-	}
-	return binary.LittleEndian.Uint64(val)
+	return e.applied.Load()
 }
 
 // CreateCheckpoint serialises the current database state to dir/dump.
