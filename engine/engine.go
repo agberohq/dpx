@@ -110,6 +110,19 @@ type Snapshot interface {
 	Close() error
 }
 
+// ValueViewer is an optional Snapshot capability: ViewValue returns the stored
+// value without copying it.
+//
+// The returned slice is immutable — engines never mutate a stored value in
+// place; they append a new version — so it stays valid while the snapshot is
+// open and may be retained afterwards. Callers MUST NOT modify it.
+//
+// Use it on hot read paths where the caller decodes the value and discards it;
+// callers that need a mutable buffer must use Get.
+type ValueViewer interface {
+	ViewValue(key []byte) ([]byte, error)
+}
+
 // Iterator scans keys in sorted order.
 // Callers must call Close() when done.
 type Iterator interface {

@@ -33,7 +33,10 @@ func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if isReserved(key) {
 		return nil, ErrReservedKey
 	}
-	val, err := tx.snap.Get(key)
+	// ViewValue (when the engine supports it) skips a copy of the stored
+	// value. The returned slice is immutable and owned by the engine; callers
+	// of KVTx.Get must not modify it.
+	val, err := snapshotValue(tx.snap, key)
 	if err != nil {
 		// Translate the engine-level sentinel to the dpx-level sentinel so
 		// callers can use dpx.IsNotFound without importing engine.
@@ -56,6 +59,14 @@ func (tx *dpxTx) Get(ctx context.Context, key []byte) ([]byte, error) {
 	// We intentionally do NOT call snap.GetVersion here.
 	tx.readSet[k] = shared.ReadEntry{Key: []byte(k), Epoch: 0, IsDebit: false}
 	return val, nil
+}
+
+// snapshotValue reads key from snap, preferring the zero-copy path.
+func snapshotValue(snap engine.Snapshot, key []byte) ([]byte, error) {
+	if vv, ok := snap.(engine.ValueViewer); ok {
+		return vv.ViewValue(key)
+	}
+	return snap.Get(key)
 }
 
 // Set buffers a plain write.
@@ -88,7 +99,7 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 		return 0, ErrReservedKey
 	}
 	if delta > 0 {
-		val, err := tx.snap.Get(key)
+		val, err := snapshotValue(tx.snap, key)
 		if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
 			return 0, err
 		}
@@ -106,7 +117,7 @@ func (tx *dpxTx) AtomicAdd(ctx context.Context, key []byte, delta int64) (int64,
 		// only delta <= 0 promises the new value).
 		return decodeInt64(val), nil
 	}
-	val, err := tx.snap.Get(key)
+	val, err := snapshotValue(tx.snap, key)
 	if err != nil && !errors.Is(err, engine.ErrKeyNotFound) {
 		return 0, err
 	}
