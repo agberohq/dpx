@@ -3,7 +3,7 @@ module github.com/agberohq/dpx
 go 1.26.0
 
 require (
-	github.com/agberohq/oshodi v0.0.0-20261109205630-db8bb2f6912f
+	github.com/agberohq/oshodi v0.0.0-20261119125611-05dd41c9ac74
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/dgraph-io/badger/v4 v4.9.6
 	github.com/hashicorp/raft v1.8.0
@@ -69,7 +69,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.6 // indirect
-	golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4 // indirect
+	golang.org/x/exp v0.0.0-20261118215729-2791e4028fd4 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
@@ -77,3 +77,7 @@ require (
 
 // raft-boltdb tests import go-metrics/compat, removed in v0.7.0.
 replace github.com/hashicorp/go-metrics => github.com/hashicorp/go-metrics v0.5.4
+
+// Local development: the adapter uses Oshodi snapshots (Bucket.Snapshot).
+// Replace with a version bump once Oshodi publishes them.
+replace github.com/agberohq/oshodi => /Users/oleku/gopath/src/github.com/agberohq/oshodi

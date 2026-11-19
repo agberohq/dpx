@@ -5,7 +5,9 @@
 package oshodi
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,7 +61,11 @@ func (e *Engine) Open() error {
 		return fmt.Errorf("oshodi open: %w", err)
 	}
 	e.db = db
-	e.bucket = db.Bucket(dpxBucket)
+	bucket, err := db.Bucket(dpxBucket)
+	if err != nil {
+		return fmt.Errorf("oshodi bucket %q: %w", dpxBucket, err)
+	}
+	e.bucket = bucket
 
 	// Restore current sequence from stored applied key.
 	seq, err := e.readApplied()
@@ -93,29 +99,26 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
-// GetSnapshot returns a consistent point-in-time view by materializing
-// all current key-value pairs. Oshodi does not provide native snapshots,
-// so we capture the current state into a map.
+// GetSnapshot returns a point-in-time view backed by Oshodi's snapshot.
+//
+// Oshodi snapshots are an offset watermark, not a copy: creating one is O(1)
+// and reads resolve through the engine's displaced-version history. The value
+// and its __dpx:ver: epoch are therefore both read as of the same watermark,
+// which is what optimistic conflict detection needs.
 func (e *Engine) GetSnapshot() (engine.Snapshot, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	data := make(map[string][]byte)
-	err := e.bucket.Scan(func(key, value []byte) bool {
-		k := string(key)
-		v := make([]byte, len(value))
-		copy(v, value)
-		data[k] = v
-		return true
-	})
+	view, err := e.bucket.Snapshot()
 	if err != nil {
 		return nil, err
 	}
-
+	seq := e.seq
+	if v, err := e.readApplied(); err == nil {
+		seq = v
+	}
 	return &oshodiSnapshot{
-		data:      data,
-		seq:       e.seq,
+		view:      view,
+		seq:       seq,
 		telemetry: e.telemetry,
+		versions:  make(map[string]engine.EpochRecord, 8),
 	}, nil
 }
 
@@ -222,7 +225,10 @@ func (e *Engine) CreateCheckpoint(dir string) error {
 	}
 	defer cpDB.Close()
 
-	bucket := cpDB.Bucket(dpxBucket)
+	bucket, berr := cpDB.Bucket(dpxBucket)
+	if berr != nil {
+		return fmt.Errorf("oshodi bucket %q: %w", dpxBucket, berr)
+	}
 	for k, v := range data {
 		if err := bucket.Set([]byte(k), v); err != nil {
 			return err
@@ -293,26 +299,55 @@ func (e *Engine) readApplied() (uint64, error) {
 // Snapshot
 
 type oshodiSnapshot struct {
-	data      map[string][]byte
+	view      *oshodi.BucketSnapshot
 	seq       uint64
 	telemetry engine.StageRecorder
+	// versions caches the epoch observed for each key read through this view.
+	// Get reads the value and its __dpx:ver: record in one GetMany call, so
+	// GetVersion costs nothing extra at commit time.
+	versions map[string]engine.EpochRecord
+}
+
+func versionKeyOf(key []byte) []byte {
+	out := make([]byte, 0, len("__dpx:ver:")+len(key))
+	out = append(out, "__dpx:ver:"...)
+	return append(out, key...)
 }
 
 func (s *oshodiSnapshot) Get(key []byte) ([]byte, error) {
-	val, ok := s.data[string(key)]
-	if !ok {
+	// One snapshot read covers the value and its epoch: both resolve at the
+	// same watermark, and the epoch is cached for the commit-time GetVersion.
+	vk := versionKeyOf(key)
+	got, err := s.view.GetMany([][]byte{key, vk})
+	if err != nil {
+		return nil, err
+	}
+	var val []byte
+	var haveValue bool
+	for _, kv := range got {
+		switch {
+		case bytes.Equal(kv.Key, key):
+			val, haveValue = kv.Value, true
+		case bytes.Equal(kv.Key, vk):
+			s.versions[string(key)] = decodeEpochRecord(kv.Value)
+		}
+	}
+	if !haveValue {
 		return nil, engine.ErrKeyNotFound
 	}
-	cp := make([]byte, len(val))
-	copy(cp, val)
-	return cp, nil
+	return val, nil
 }
 
 func (s *oshodiSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
-	vk := "__dpx:ver:" + string(key)
-	val, ok := s.data[vk]
-	if !ok {
-		return engine.EpochRecord{}, nil
+	if er, ok := s.versions[string(key)]; ok {
+		return er, nil
+	}
+	val, err := s.view.Get(versionKeyOf(key))
+	if err != nil {
+		if errors.Is(err, oshodi.ErrKeyNotFound) {
+			return engine.EpochRecord{}, nil
+		}
+		return engine.EpochRecord{}, err
 	}
 	return decodeEpochRecord(val), nil
 }
@@ -325,24 +360,21 @@ func (s *oshodiSnapshot) NewIter(start, end []byte) engine.Iterator {
 
 	prefix := "__dpx:"
 	var pairs [][2][]byte
-	ss := string(start)
-	se := string(end)
 
-	for k, v := range s.data {
-		if k < ss {
-			continue
-		}
-		if se != "" && k >= se {
-			continue
-		}
+	err := s.view.ScanRange(start, end, func(key, value []byte) bool {
+		k := string(key)
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
-			continue
+			return true
 		}
-		kc := make([]byte, len(k))
-		copy(kc, k)
-		vc := make([]byte, len(v))
-		copy(vc, v)
+		kc := make([]byte, len(key))
+		copy(kc, key)
+		vc := make([]byte, len(value))
+		copy(vc, value)
 		pairs = append(pairs, [2][]byte{kc, vc})
+		return true
+	})
+	if err != nil {
+		return &errIter{err: err}
 	}
 
 	sort.Slice(pairs, func(i, j int) bool {
@@ -357,7 +389,7 @@ func (s *oshodiSnapshot) NewIter(start, end []byte) engine.Iterator {
 }
 
 func (s *oshodiSnapshot) Sequence() uint64 { return s.seq }
-func (s *oshodiSnapshot) Close() error     { return nil }
+func (s *oshodiSnapshot) Close() error     { return s.view.Close() }
 
 // Batch
 

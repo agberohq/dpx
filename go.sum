@@ -8,6 +8,8 @@ github.com/agberohq/oshodi v0.0.0-20261103212633-bf351f7cea42 h1:CjgsbKxQ4CeV516
 github.com/agberohq/oshodi v0.0.0-20261103212633-bf351f7cea42/go.mod h1:F2EnZ82IhQxPQqYDUPKuLL0m9zwq40XLjZY1AgPSisw=
 github.com/agberohq/oshodi v0.0.0-20261109205630-db8bb2f6912f h1:kSAFL3ue5ffS6jcNrftNdnZgCt4Lw9jdECoygyWt9oU=
 github.com/agberohq/oshodi v0.0.0-20261109205630-db8bb2f6912f/go.mod h1:F2EnZ82IhQxPQqYDUPKuLL0m9zwq40XLjZY1AgPSisw=
+github.com/agberohq/oshodi v0.0.0-20261119125611-05dd41c9ac74 h1:BchtM7O4bow8g04exXyhfba93pQKw2sc0+xAZRaJ5ww=
+github.com/agberohq/oshodi v0.0.0-20261119125611-05dd41c9ac74/go.mod h1:XXL8AYRbf5GBWGcgVw9pQZU0ampXc0bsTI+F/PObXiY=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
 github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
@@ -304,6 +306,8 @@ golang.org/x/exp v0.0.0-20261112173441-d10d3b464990 h1:Ki27Rkann+mW+hv34e1eegTr8
 golang.org/x/exp v0.0.0-20261112173441-d10d3b464990/go.mod h1:J3U+E8RzytcGvwz+uJuAP4zULJ2TkAQBnmPZMexpdXs=
 golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4 h1:lfvjMWyv5q5oJgIhGfBDf7Szvu8POtgSpMy2XbXlEFs=
 golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4/go.mod h1:J3U+E8RzytcGvwz+uJuAP4zULJ2TkAQBnmPZMexpdXs=
+golang.org/x/exp v0.0.0-20261118215729-2791e4028fd4 h1:XUjsO37lvrmMZj81B2qUFhnGRTGdG9jYMljMO65o6CQ=
+golang.org/x/exp v0.0.0-20261118215729-2791e4028fd4/go.mod h1:xeYMf2GfgE/gQmBtvdPsBN608YETsXuvoiEhaOxGg/w=
 golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
 golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
 golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod h1:jJ57K6gSWd91VN4djpZkiMVwK6gcyfeH4XE8wZrZaV4=

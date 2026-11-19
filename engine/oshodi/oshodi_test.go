@@ -361,6 +361,9 @@ func TestEngine_SetTelemetryIsSafe(t *testing.T) {
 }
 
 // Snapshot
+//
+// Oshodi snapshots are an offset watermark plus a displaced-version history, so
+// a view is O(1) to create and still isolated from later writes.
 
 func TestSnapshot_IsolatedFromSubsequentWrites(t *testing.T) {
 	e := openEngine(t)
@@ -392,13 +395,10 @@ func TestSnapshot_IsolatedFromDeletes(t *testing.T) {
 
 	applyDel(t, e, "k")
 
-	// Snapshot still sees the deleted key.
+	// The view predates the delete, so it still sees the value.
 	val, err := snap.Get([]byte("k"))
-	if err != nil {
-		t.Fatalf("snap.Get after delete: %v", err)
-	}
-	if string(val) != "v" {
-		t.Errorf("snapshot lost key on delete: got %v", err)
+	if err != nil || string(val) != "v" {
+		t.Fatalf("snap.Get after delete = %q, %v; want v", val, err)
 	}
 }
 
