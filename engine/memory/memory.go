@@ -208,7 +208,9 @@ func (e *Engine) ApplyShardDirect(shardIdx int, writes []WriteOp, applied uint64
 		case 's':
 			next.tree.Set(item{key: w.Key, value: w.Value})
 			if w.Key == "__dpx:applied" && len(w.Value) >= 8 {
-				next.applied = binary.LittleEndian.Uint64(w.Value)
+				if v := binary.LittleEndian.Uint64(w.Value); v > next.applied {
+					next.applied = v
+				}
 			}
 		case 'd':
 			next.tree.Delete(item{key: w.Key})
@@ -245,7 +247,9 @@ func (ss *ShardStateDirect) ApplyDirect(writes []WriteOp, applied uint64) {
 		case 's':
 			next.tree.Set(item{key: w.Key, value: w.Value})
 			if w.Key == "__dpx:applied" && len(w.Value) >= 8 {
-				next.applied = binary.LittleEndian.Uint64(w.Value)
+				if v := binary.LittleEndian.Uint64(w.Value); v > next.applied {
+					next.applied = v
+				}
 			}
 		case 'd':
 			next.tree.Delete(item{key: w.Key})
@@ -285,7 +289,11 @@ func (e *Engine) applyBatchLegacy(b engine.Batch) error {
 		case 's':
 			next.tree.Set(item{key: op.key, value: op.value})
 			if op.key == "__dpx:applied" && len(op.value) >= 8 {
-				next.applied = binary.LittleEndian.Uint64(op.value)
+				// Monotonic: concurrent appliers can commit out of sequence
+				// order, and the applied marker must not go backwards.
+				if v := binary.LittleEndian.Uint64(op.value); v > next.applied {
+					next.applied = v
+				}
 			}
 		case 'd':
 			next.tree.Delete(item{key: op.key})
@@ -338,7 +346,9 @@ func (e *Engine) applyBatchSharded(b engine.Batch) error {
 			case 's':
 				next.tree.Set(item{key: op.key, value: op.value})
 				if op.key == "__dpx:applied" && len(op.value) >= 8 {
-					next.applied = binary.LittleEndian.Uint64(op.value)
+					if v := binary.LittleEndian.Uint64(op.value); v > next.applied {
+						next.applied = v
+					}
 				}
 			case 'd':
 				next.tree.Delete(item{key: op.key})

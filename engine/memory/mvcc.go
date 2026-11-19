@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/agberohq/dpx/engine"
 )
@@ -48,18 +49,19 @@ type MVCCEngine struct {
 	// Global sequence counter for versioning
 	seqCounter atomic.Uint64
 
-	// lastCommitted tracks the highest sequence for which all entries have been
-	// written to shard slices. Updated at the end of ApplyBatch after all shards
-	// are written. Snapshots use this instead of seqCounter to avoid seeing
-	// entries from a batch that hasn't finished writing yet.
-	lastCommitted atomic.Uint64
+	// commits publishes multi-shard commits in sequence order. Snapshots read
+	// from it instead of seqCounter so they never observe a commit whose shards
+	// are only partially written. Concurrent appliers make a plain "highest
+	// completed sequence" watermark incorrect: two overlapping commits could
+	// publish a sequence whose writes are not all visible yet.
+	commits *commitTracker
 
 	// Compaction threshold: if a key has more versions than this, compact
 	compactThreshold int
 
-	// Active snapshot tracking for safe compaction
-	oldestSnapshot atomic.Uint64 // lowest sequence of any open snapshot
-	snapshotCount  atomic.Int64  // number of open snapshots
+	// Active snapshot tracking for safe compaction. The oldest live snapshot
+	// is tracked exactly and raised again when snapshots close.
+	snaps snapshotTracker
 
 	// Background compaction control
 	compactStop chan struct{}
@@ -79,6 +81,9 @@ type MVCCEngine struct {
 type mvccShard struct {
 	mu   sync.RWMutex            // guards the data map structure
 	data map[string]*atomicValue // key -> atomic pointer to []*mvccEntry
+	// dirty records keys written since the last compaction pass, so compaction
+	// cost follows recent writes instead of the whole keyspace.
+	dirty map[string]struct{}
 }
 
 // lookup resolves the atomic value for key under a brief read lock, or
@@ -95,12 +100,19 @@ func (s *mvccShard) lookup(key string) *atomicValue {
 // atomicValue wraps []*mvccEntry with atomic load/store for lock-free reads.
 type atomicValue struct {
 	v atomic.Pointer[mvccEntrySlice]
+	// sorted reports whether the entry slice is in ascending commit-sequence
+	// order, which lets version lookups binary search instead of scanning.
+	// Appends through the proposer are ordered per key (the key's conflict
+	// stripe is held for check-and-apply), so this stays true on the hot path;
+	// a direct concurrent ApplyBatch that appends out of order clears it.
+	sorted atomic.Bool
 }
 
 type mvccEntrySlice []*mvccEntry
 
 func newAtomicValue(entries []*mvccEntry) *atomicValue {
 	av := &atomicValue{}
+	av.sorted.Store(true)
 	s := mvccEntrySlice(entries)
 	av.v.Store(&s)
 	return av
@@ -143,10 +155,11 @@ func newMVCCEngine(sharded bool) *MVCCEngine {
 		compactStop:      make(chan struct{}),
 		compactDone:      make(chan struct{}),
 	}
-	e.oldestSnapshot.Store(0)
+	e.commits = newCommitTracker()
 	for i := range e.shards {
 		e.shards[i] = &mvccShard{
-			data: make(map[string]*atomicValue, 1024),
+			data:  make(map[string]*atomicValue, 1024),
+			dirty: make(map[string]struct{}, 256),
 		}
 	}
 	prefix := "dpx-mvcc"
@@ -173,6 +186,7 @@ func (e *MVCCEngine) Open() error {
 		return fmt.Errorf("mvcc engine: load dump: %w", err)
 	}
 	e.seqCounter.Store(applied)
+	e.commits.reset(applied)
 	for k, v := range data {
 		sh := shardFor(k)
 		s := e.shards[sh]
@@ -188,6 +202,7 @@ func (e *MVCCEngine) Open() error {
 			value: v,
 		})
 		av.Store(entries)
+		s.dirty[k] = struct{}{}
 		s.mu.Unlock()
 	}
 	return nil
@@ -227,30 +242,14 @@ func (e *MVCCEngine) Get(key []byte) ([]byte, error) {
 }
 
 func (e *MVCCEngine) GetSnapshot() (engine.Snapshot, error) {
-	// Read the last committed sequence. This is the highest sequence for which
-	// all entries have been fully written to the shard slices. We use a separate
-	// atomic to avoid the race where seqCounter has been incremented by a batch
-	// that hasn't finished writing its entries yet.
-	seq := e.lastCommitted.Load()
+	// Read the last fully published sequence: every commit up to and including
+	// it has all of its shards written.
+	seq := e.commits.published.Load()
 	snap := &mvccSnapshot{
 		seq:    seq,
 		engine: e,
 	}
-	// Track this snapshot for safe compaction.
-	// Only update oldestSnapshot if this snapshot is older than the current tracked one.
-	e.snapshotCount.Add(1)
-	for {
-		old := e.oldestSnapshot.Load()
-		if old == 0 || seq < old {
-			if e.oldestSnapshot.CompareAndSwap(old, seq) {
-				break
-			}
-			// CAS failed, another goroutine updated it; retry
-			continue
-		}
-		// This snapshot is newer than the oldest; no need to update
-		break
-	}
+	e.snaps.add(seq)
 	return snap, nil
 }
 
@@ -266,10 +265,11 @@ func (e *MVCCEngine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
 		return nil
 	}
 
-	// Atomic commit protocol: assign a single commit sequence for the entire batch.
+	// Atomic commit protocol: reserve one sequence range for the entire batch.
 	// All keys in this batch become visible at the same sequence, so a snapshot
-	// cannot see only part of the transaction.
-	commitSeq := e.seqCounter.Add(uint64(len(mb.ops)))
+	// cannot see only part of the transaction. The range is only published once
+	// every shard has been written (see commitTracker).
+	startSeq, commitSeq := e.commits.reserve(&e.seqCounter, uint64(len(mb.ops)))
 
 	// Group by shard
 	byShard := make(map[int][]mvccBatchOp)
@@ -293,40 +293,26 @@ func (e *MVCCEngine) ApplyBatch(b engine.Batch, _ engine.WriteOptions) error {
 				av = newAtomicValue(nil)
 				s.data[op.key] = av
 			}
+			s.dirty[op.key] = struct{}{}
 			entries := av.Load()
 			switch op.op {
-			case 's':
-				entries = append(entries, entry)
-			case 'd':
-				entries = append(entries, entry)
+			case 's', 'd':
+				entries = appendVersion(av, entries, entry)
 			case 'm':
 				// For merge, find the current value and add delta
-				current := e.getCurrentValue(entries)
+				current := e.getCurrentValue(av, entries)
 				delta := decodeInt64MVCC(op.value)
 				newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
 				entry.value = newVal
-				entries = append(entries, entry)
+				entries = appendVersion(av, entries, entry)
 			}
 			av.Store(entries)
 		}
 		s.mu.Unlock()
 	}
 
-	// Mark this commit as fully visible. Snapshots taken after this point
-	// will see all entries in this batch.
-	// Monotonic store: a concurrent batch may already have published a
-	// higher sequence; lastCommitted must never regress, or a snapshot
-	// created afterwards would be older than one created earlier.
-	for {
-		cur := e.lastCommitted.Load()
-		if commitSeq <= cur {
-			break
-		}
-		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
-			break
-		}
-	}
-
+	// Publish: advances only across a contiguous prefix of completed commits.
+	e.commits.complete(startSeq, commitSeq)
 	return nil
 }
 
@@ -335,6 +321,9 @@ type MVCCWriteOp struct {
 	Key   string
 	Value []byte
 	Op    byte // 's' = set, 'd' = delete, 'm' = merge
+	// Shard is the engine shard the key hashes to. Only read by
+	// ApplySortedDirect; the other apply paths compute it themselves.
+	Shard int
 }
 
 // EngineShardFor reports the engine shard a key hashes to. Exported so the
@@ -355,7 +344,7 @@ func (e *MVCCEngine) ApplyShardsDirect(groups map[int][]MVCCWriteOp) uint64 {
 	if total == 0 {
 		return e.seqCounter.Load()
 	}
-	commitSeq := e.seqCounter.Add(uint64(total))
+	startSeq, commitSeq := e.commits.reserve(&e.seqCounter, uint64(total))
 
 	for shardIdx, ws := range groups {
 		if len(ws) == 0 {
@@ -364,38 +353,46 @@ func (e *MVCCEngine) ApplyShardsDirect(groups map[int][]MVCCWriteOp) uint64 {
 		e.applyOneShard(shardIdx, ws, commitSeq)
 	}
 
-	// Mark this commit as fully visible (monotonic; see ApplyBatch).
-	for {
-		cur := e.lastCommitted.Load()
-		if commitSeq <= cur {
-			break
-		}
-		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
-			break
-		}
-	}
+	e.commits.complete(startSeq, commitSeq)
 	return commitSeq
 }
 
 // applyOneShard applies one shard group's ops at the given commit sequence.
-func (e *MVCCEngine) applyOneShard(shardIdx int, ws []MVCCWriteOp, commitSeq uint64) {
-	s := e.shards[shardIdx]
+// keyedOp is one write ready to apply: the entry is built before the shard
+// lock is taken so the critical section stays short.
+type keyedOp struct {
+	key   string
+	entry *mvccEntry
+	op    byte
+	value []byte
+}
 
-	type keyedOp struct {
-		key   string
-		entry *mvccEntry
-		op    byte
-		value []byte
-	}
-	ops := make([]keyedOp, 0, len(ws))
-	for _, w := range ws {
-		entry := &mvccEntry{
-			seq:     commitSeq,
-			value:   w.Value,
-			deleted: w.Op == 'd',
+// newKeyedOps materialises entries for ws at commitSeq. Callers with several
+// shard groups allocate one slice for the whole transaction and pass sub-slices
+// to applyShardEntries, instead of allocating per shard.
+func newKeyedOps(ws []MVCCWriteOp, commitSeq uint64) []keyedOp {
+	ops := make([]keyedOp, len(ws))
+	for i, w := range ws {
+		ops[i] = keyedOp{
+			key:   w.Key,
+			entry: &mvccEntry{seq: commitSeq, value: w.Value, deleted: w.Op == 'd'},
+			op:    w.Op,
+			value: w.Value,
 		}
-		ops = append(ops, keyedOp{key: w.Key, entry: entry, op: w.Op, value: w.Value})
 	}
+	return ops
+}
+
+func (e *MVCCEngine) applyOneShard(shardIdx int, ws []MVCCWriteOp, commitSeq uint64) {
+	e.applyShardEntries(shardIdx, newKeyedOps(ws, commitSeq))
+}
+
+// applyShardEntries applies pre-built entries to one shard under its write lock.
+func (e *MVCCEngine) applyShardEntries(shardIdx int, ops []keyedOp) {
+	if len(ops) == 0 {
+		return
+	}
+	s := e.shards[shardIdx]
 
 	s.mu.Lock()
 	for _, ko := range ops {
@@ -404,20 +401,47 @@ func (e *MVCCEngine) applyOneShard(shardIdx int, ws []MVCCWriteOp, commitSeq uin
 			av = newAtomicValue(nil)
 			s.data[ko.key] = av
 		}
+		s.dirty[ko.key] = struct{}{}
 		entries := av.Load()
 		switch ko.op {
 		case 's', 'd':
-			entries = append(entries, ko.entry)
+			entries = appendVersion(av, entries, ko.entry)
 		case 'm':
-			current := e.getCurrentValue(entries)
+			current := e.getCurrentValue(av, entries)
 			delta := decodeInt64MVCC(ko.value)
 			newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
 			ko.entry.value = newVal
-			entries = append(entries, ko.entry)
+			entries = appendVersion(av, entries, ko.entry)
 		}
 		av.Store(entries)
 	}
 	s.mu.Unlock()
+}
+
+// ApplySortedDirect applies ops that the caller has already sorted by Shard,
+// taking each shard's write lock once for its contiguous run. A caller-sorted
+// flat slice avoids per-shard grouping allocations.
+// Caller must hold the proposer's conflict stripes for these keys.
+func (e *MVCCEngine) ApplySortedDirect(ops []MVCCWriteOp) uint64 {
+	if len(ops) == 0 {
+		return e.seqCounter.Load()
+	}
+	startSeq, commitSeq := e.commits.reserve(&e.seqCounter, uint64(len(ops)))
+
+	// One allocation for the whole transaction, not one per shard run.
+	entries := newKeyedOps(ops, commitSeq)
+	for i := 0; i < len(ops); {
+		shardIdx := ops[i].Shard
+		j := i + 1
+		for j < len(ops) && ops[j].Shard == shardIdx {
+			j++
+		}
+		e.applyShardEntries(shardIdx, entries[i:j])
+		i = j
+	}
+
+	e.commits.complete(startSeq, commitSeq)
+	return commitSeq
 }
 
 // ApplyShardDirect applies writes directly to a specific shard.
@@ -437,8 +461,8 @@ func (e *MVCCEngine) applyOneShard(shardIdx int, ws []MVCCWriteOp, commitSeq uin
 // Compact() which runs in the background every 100ms.
 //
 // Returns the commit sequence assigned to this batch.
-func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64 { // Atomic commit protocol: assign a single commit sequence for this shard's writes.
-	commitSeq := e.seqCounter.Add(uint64(len(writes)))
+func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64 { // Atomic commit protocol: reserve a sequence range for this shard's writes.
+	startSeq, commitSeq := e.commits.reserve(&e.seqCounter, uint64(len(writes)))
 
 	s := e.shards[shardIdx]
 
@@ -467,42 +491,55 @@ func (e *MVCCEngine) ApplyShardDirect(shardIdx int, writes []MVCCWriteOp) uint64
 			av = newAtomicValue(nil)
 			s.data[ko.key] = av
 		}
+		s.dirty[ko.key] = struct{}{}
 		entries := av.Load()
 		switch ko.op {
 		case 's', 'd':
-			entries = append(entries, ko.entry)
+			entries = appendVersion(av, entries, ko.entry)
 		case 'm':
-			current := e.getCurrentValue(entries)
+			current := e.getCurrentValue(av, entries)
 			delta := decodeInt64MVCC(ko.value)
 			newVal := encodeInt64MVCC(decodeInt64MVCC(current) + delta)
 			ko.entry.value = newVal
-			entries = append(entries, ko.entry)
+			entries = appendVersion(av, entries, ko.entry)
 		}
 		av.Store(entries)
 	}
 	s.mu.Unlock()
 
-	// Mark this commit as fully visible (monotonic; see ApplyBatch).
-	for {
-		cur := e.lastCommitted.Load()
-		if commitSeq <= cur {
-			break
-		}
-		if e.lastCommitted.CompareAndSwap(cur, commitSeq) {
-			break
-		}
-	}
+	e.commits.complete(startSeq, commitSeq)
 
 	return commitSeq
 }
 
-func (e *MVCCEngine) getCurrentValue(entries []*mvccEntry) []byte {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if !entries[i].deleted {
-			return entries[i].value
+// appendVersion appends entry to av, clearing the sorted hint when the new
+// sequence is lower than the last appended one.
+func appendVersion(av *atomicValue, entries []*mvccEntry, entry *mvccEntry) []*mvccEntry {
+	if n := len(entries); n > 0 && entries[n-1].seq > entry.seq {
+		av.sorted.Store(false)
+	}
+	return append(entries, entry)
+}
+
+// getCurrentValue returns the value of the newest version. Entries are
+// appended in write order, which concurrent appliers make non-monotonic, so we
+// scan for the highest sequence rather than assuming the last entry is newest.
+func (e *MVCCEngine) getCurrentValue(av *atomicValue, entries []*mvccEntry) []byte {
+	newest := -1
+	if av.sorted.Load() {
+		newest = len(entries) - 1
+	} else {
+		var newestSeq uint64
+		for i, en := range entries {
+			if newest < 0 || en.seq >= newestSeq {
+				newest, newestSeq = i, en.seq
+			}
 		}
 	}
-	return nil
+	if newest < 0 || entries[newest].deleted {
+		return nil
+	}
+	return entries[newest].value
 }
 
 func (e *MVCCEngine) CurrentSequence() uint64 {
@@ -539,7 +576,7 @@ func (e *MVCCEngine) CreateCheckpoint(dir string) error {
 }
 
 func (e *MVCCEngine) RawIter(start, end []byte) engine.Iterator {
-	return e.newIterator(start, end, e.seqCounter.Load())
+	return e.newIterator(start, end, e.commits.published.Load())
 }
 
 // IsSharded reports whether this engine uses sharded storage.
@@ -575,20 +612,48 @@ func (e *MVCCEngine) compactLoop() {
 func (e *MVCCEngine) Compact() int {
 	// If any snapshots are active, be conservative: only remove versions
 	// that are strictly before the oldest snapshot's sequence.
-	safeSeq := uint64(0)
-	if e.snapshotCount.Load() > 0 {
-		safeSeq = e.oldestSnapshot.Load()
-	}
+	safeSeq := e.snaps.oldest()
 
 	var removed int
 	for i := range e.shards {
 		s := e.shards[i]
 		s.mu.Lock()
-		for k, av := range s.data {
+		if len(s.dirty) == 0 {
+			s.mu.Unlock()
+			continue
+		}
+		dirty := s.dirty
+		s.dirty = make(map[string]struct{}, len(dirty)/2+1)
+
+		for k := range dirty {
+			av, ok := s.data[k]
+			if !ok {
+				continue
+			}
 			entries := av.Load()
-			// Clean up tombstones first: if the latest entry is a delete and
-			// there are no active snapshots that could see it, remove the key entirely
-			if safeSeq == 0 && len(entries) >= 1 && entries[len(entries)-1].deleted {
+			if len(entries) == 0 {
+				continue
+			}
+
+			// Find the two newest versions by sequence. Append order is write
+			// order, not sequence order, so index position cannot be used.
+			newest1, newest2 := -1, -1
+			for i := range entries {
+				if newest1 < 0 || entries[i].seq > entries[newest1].seq {
+					newest2 = newest1
+					newest1 = i
+					continue
+				}
+				if newest2 < 0 || entries[i].seq > entries[newest2].seq {
+					newest2 = i
+				}
+			}
+			if newest1 < 0 {
+				continue
+			}
+
+			// Tombstone cleanup: nothing can still read this key, so drop it.
+			if safeSeq == 0 && entries[newest1].deleted {
 				removed += len(entries)
 				delete(s.data, k)
 				continue
@@ -598,36 +663,20 @@ func (e *MVCCEngine) Compact() int {
 				continue
 			}
 
-			// Find how many entries are strictly before the safety boundary.
-			// These are the only ones we can safely remove.
-			removeCount := 0
-			if safeSeq > 0 {
-				// Count entries with seq < safeSeq
-				for j, entry := range entries {
-					if entry.seq < safeSeq {
-						removeCount = j + 1
-					} else {
-						break
-					}
+			kept := make([]*mvccEntry, 0, len(entries))
+			for i, en := range entries {
+				if i == newest1 || i == newest2 || (safeSeq > 0 && en.seq >= safeSeq) {
+					kept = append(kept, en)
 				}
-				// Always keep at least the last 2 entries
-				keep := len(entries) - removeCount
-				if keep < 2 {
-					removeCount = len(entries) - 2
-				}
-			} else {
-				// No active snapshots: can remove all but the last 2
-				removeCount = len(entries) - 2
 			}
-
-			if removeCount > 0 {
-				removed += removeCount
-				// Create a new slice with only the kept entries.
-				// Store atomically so readers never see a partially-compacteд state.
-				kept := make([]*mvccEntry, len(entries)-removeCount)
-				copy(kept, entries[removeCount:])
-				av.Store(kept)
+			if len(kept) == len(entries) {
+				continue
 			}
+			// Restore ascending order so later lookups can binary search.
+			sort.Slice(kept, func(i, j int) bool { return kept[i].seq < kept[j].seq })
+			av.sorted.Store(true)
+			removed += len(entries) - len(kept)
+			av.Store(kept)
 		}
 		s.mu.Unlock()
 	}
@@ -671,10 +720,13 @@ type mvccSnapshot struct {
 }
 
 func (s *mvccSnapshot) Get(key []byte) ([]byte, error) {
-	sh := shardFor(string(key))
+	// The lookup key is only used for the duration of the map read, so it can
+	// alias the caller's buffer instead of allocating a string per read.
+	k := unsafe.String(unsafe.SliceData(key), len(key))
+	sh := shardFor(k)
 	st := s.engine.shards[sh]
 
-	av := st.lookup(string(key))
+	av := st.lookup(k)
 	if av == nil {
 		return nil, engine.ErrKeyNotFound
 	}
@@ -685,8 +737,8 @@ func (s *mvccSnapshot) Get(key []byte) ([]byte, error) {
 	if len(entries) == 0 {
 		return nil, engine.ErrKeyNotFound
 	}
-	// Binary search for the latest entry <= snapshot seq
-	idx := s.findVersion(entries, s.seq)
+	// Newest version visible at this snapshot's sequence.
+	idx := latestVersionAt(av, entries, s.seq)
 	if idx < 0 {
 		return nil, engine.ErrKeyNotFound
 	}
@@ -697,6 +749,24 @@ func (s *mvccSnapshot) Get(key []byte) ([]byte, error) {
 	cp := make([]byte, len(entry.value))
 	copy(cp, entry.value)
 	return cp, nil
+}
+
+// ViewValue returns the stored value without copying. Values are immutable:
+// a write appends a new version rather than mutating an existing one, and
+// compaction only swaps slice headers. See engine.ValueViewer.
+func (s *mvccSnapshot) ViewValue(key []byte) ([]byte, error) {
+	k := unsafe.String(unsafe.SliceData(key), len(key))
+	sh := shardFor(k)
+	av := s.engine.shards[sh].lookup(k)
+	if av == nil {
+		return nil, engine.ErrKeyNotFound
+	}
+	entries := av.Load()
+	idx := latestVersionAt(av, entries, s.seq)
+	if idx < 0 || entries[idx].deleted {
+		return nil, engine.ErrKeyNotFound
+	}
+	return entries[idx].value, nil
 }
 
 func (s *mvccSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
@@ -712,7 +782,7 @@ func (s *mvccSnapshot) GetVersion(key []byte) (engine.EpochRecord, error) {
 	if len(entries) == 0 {
 		return engine.EpochRecord{}, nil
 	}
-	idx := s.findVersion(entries, s.seq)
+	idx := latestVersionAt(av, entries, s.seq)
 	if idx < 0 {
 		return engine.EpochRecord{}, nil
 	}
@@ -726,28 +796,37 @@ func (s *mvccSnapshot) NewIter(start, end []byte) engine.Iterator {
 
 func (s *mvccSnapshot) Sequence() uint64 { return s.seq }
 func (s *mvccSnapshot) Close() error {
-	// Release this snapshot from tracking
-	s.engine.snapshotCount.Add(-1)
+	// Release this snapshot from tracking.
+	s.engine.snaps.remove(s.seq)
 	return nil
 }
 
-// findVersion performs binary search for the latest entry with seq <= targetSeq.
-func (s *mvccSnapshot) findVersion(entries []*mvccEntry, targetSeq uint64) int {
-	// Entries are appended in order, so seq is monotonically increasing.
-	// We need the latest entry with seq <= targetSeq.
-	low := 0
-	hi := len(entries) - 1
-	result := -1
-	for low <= hi {
-		mid := low + (hi-low)/2
-		if entries[mid].seq <= targetSeq {
-			result = mid
-			low = mid + 1
-		} else {
-			hi = mid - 1
+// latestVersionAt returns the index of the newest version visible at target:
+// the entry with the greatest seq <= target, ties resolving to the later append.
+//
+// Append order is write order, not sequence order: two concurrent appliers can
+// write a higher sequence before a lower one. A binary search over an unsorted
+// slice returns the wrong version, so this scans (version chains are short —
+// compaction keeps at most a couple of versions past the oldest snapshot).
+func latestVersionAt(av *atomicValue, entries []*mvccEntry, target uint64) int {
+	if av.sorted.Load() {
+		i := sort.Search(len(entries), func(i int) bool { return entries[i].seq > target })
+		if i == 0 {
+			return -1
+		}
+		return i - 1
+	}
+	best := -1
+	var bestSeq uint64
+	for i, en := range entries {
+		if en.seq > target {
+			continue
+		}
+		if best < 0 || en.seq >= bestSeq {
+			best, bestSeq = i, en.seq
 		}
 	}
-	return result
+	return best
 }
 
 // newIterator creates an iterator over the key range at the given sequence.
@@ -777,7 +856,7 @@ func (e *MVCCEngine) newIterator(start, end []byte, seq uint64) engine.Iterator 
 				continue
 			}
 			// Find the right version
-			idx := findVersionLinear(entries, seq)
+			idx := latestVersionAt(av, entries, seq)
 			if idx >= 0 && !entries[idx].deleted {
 				cp := make([]byte, len(entries[idx].value))
 				copy(cp, entries[idx].value)
@@ -792,15 +871,6 @@ func (e *MVCCEngine) newIterator(start, end []byte, seq uint64) engine.Iterator 
 	})
 
 	return &mvccIter{pairs: pairs, pos: -1}
-}
-
-func findVersionLinear(entries []*mvccEntry, seq uint64) int {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].seq <= seq {
-			return i
-		}
-	}
-	return -1
 }
 
 // mvccIter is an iterator over MVCC data.
@@ -872,4 +942,104 @@ func decodeEpochRecordMVCC(b []byte) engine.EpochRecord {
 		Epoch:    binary.LittleEndian.Uint64(b[:8]),
 		IsCredit: b[8] == 1,
 	}
+}
+
+// snapshotTracker tracks the exact set of live snapshot sequences so
+// compaction can prune versions that no snapshot can still read.
+type snapshotTracker struct {
+	mu   sync.Mutex
+	live map[uint64]int
+	min  atomic.Uint64 // cached oldest live sequence, 0 = none
+}
+
+func (t *snapshotTracker) add(seq uint64) {
+	t.mu.Lock()
+	if t.live == nil {
+		t.live = make(map[uint64]int, 64)
+	}
+	t.live[seq]++
+	if cur := t.min.Load(); cur == 0 || seq < cur {
+		t.min.Store(seq)
+	}
+	t.mu.Unlock()
+}
+
+func (t *snapshotTracker) remove(seq uint64) {
+	t.mu.Lock()
+	if n, ok := t.live[seq]; ok {
+		if n <= 1 {
+			delete(t.live, seq)
+		} else {
+			t.live[seq] = n - 1
+		}
+	}
+	if t.min.Load() == seq {
+		var min uint64
+		first := true
+		for s := range t.live {
+			if first || s < min {
+				min, first = s, false
+			}
+		}
+		t.min.Store(min)
+	}
+	t.mu.Unlock()
+}
+
+// oldest returns the lowest live snapshot sequence, or 0 when none are open.
+func (t *snapshotTracker) oldest() uint64 {
+	return t.min.Load()
+}
+
+// commitTracker publishes commits in sequence order.
+//
+// A commit reserves a sequence range under the tracker mutex before writing any
+// shard, then marks the range complete after the last shard write. published
+// advances only across a contiguous prefix of completed ranges, so a snapshot
+// never sees a commit whose shards are partially written.
+type commitTracker struct {
+	mu        sync.Mutex
+	done      map[uint64]uint64 // range start -> end, completed but not publishable yet
+	published atomic.Uint64
+}
+
+func newCommitTracker() *commitTracker {
+	return &commitTracker{done: make(map[uint64]uint64, 64)}
+}
+
+// reset sets the published point and drops any tracked ranges. Used when
+// restoring from a checkpoint, where everything up to seq is already durable.
+func (t *commitTracker) reset(seq uint64) {
+	t.mu.Lock()
+	t.done = make(map[uint64]uint64, 64)
+	t.published.Store(seq)
+	t.mu.Unlock()
+}
+
+// reserve allocates n contiguous sequence numbers and returns the inclusive
+// range [start, end]. Allocation happens under the tracker mutex so ranges are
+// always contiguous and in ascending order.
+func (t *commitTracker) reserve(counter *atomic.Uint64, n uint64) (start, end uint64) {
+	t.mu.Lock()
+	end = counter.Add(n)
+	start = end - n + 1
+	t.mu.Unlock()
+	return start, end
+}
+
+// complete marks a reserved range as fully applied and advances published over
+// any contiguous prefix that is now complete.
+func (t *commitTracker) complete(start, end uint64) {
+	t.mu.Lock()
+	t.done[start] = end
+	for {
+		cur := t.published.Load()
+		next, ok := t.done[cur+1]
+		if !ok {
+			break
+		}
+		t.published.Store(next)
+		delete(t.done, cur+1)
+	}
+	t.mu.Unlock()
 }
